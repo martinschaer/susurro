@@ -1,0 +1,16 @@
+# Build output
+build/
+Susurro.app/
+
+# Cloned and built by setup.sh — 60 MB and carries its own .git
+vendor/
+
+# Interrupted downloads from setup.sh
+*.part
+
+# Per-machine Claude Code settings
+.claude/settings.local.json
+
+.DS_Store
+
+# Note: models and transcripts live in ~/.susurro, outside the repo.
