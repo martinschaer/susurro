@@ -44,7 +44,15 @@ enum Smoke {
 
         let out = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("susurro-smoke-\(getpid())")
-        guard let t = Transcriber(model: model, vad: nil, dir: out) else {
+        let gallery = out.appendingPathComponent("speakers.json")
+        let models = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models")
+
+        // No speaker models is a skip, not a failure — the app degrades the same way,
+        // labelling every system line "unknown" rather than losing the transcript.
+        let book = SpeakerBook(models: models, threshold: 0.65, url: gallery)
+        if book == nil { print("  SKIP  speaker labels (no speaker models — run ./setup.sh)") }
+
+        guard let t = Transcriber(model: model, vad: nil, speakers: book, dir: out) else {
             print("  FAIL  model load"); exit(1)
         }
 
@@ -54,24 +62,65 @@ enum Smoke {
         }
         check(pcm.count > 16000, "read \(pcm.count) samples from jfk.wav")
 
+        // Same audio down both streams: "mic" is you by definition, "system" has to be
+        // identified. Twice, because matching an existing speaker is a different branch
+        // from minting one.
         t.submit(pcm, source: "mic")
-        t.close()                                   // drains the queue
+        t.submit(pcm, source: "system")
+        t.submit(pcm, source: "system")
+        t.close()                                   // drains the queue, flushes the gallery
 
         let day = DateFormatter()
         day.dateFormat = "yyyy-MM-dd"
         day.locale = Locale(identifier: "en_US_POSIX")
         let jsonl = out.appendingPathComponent("\(day.string(from: Date())).jsonl")
-        guard let written = try? String(contentsOf: jsonl, encoding: .utf8),
-              let line = written.split(separator: "\n").last,
-              let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8))
-                  as? [String: Any]
-        else { print("  FAIL  no JSONL written to \(jsonl.path)"); exit(1) }
+        guard let written = try? String(contentsOf: jsonl, encoding: .utf8) else {
+            print("  FAIL  no JSONL written to \(jsonl.path)"); exit(1)
+        }
+        let lines = written.split(separator: "\n").compactMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+        }
+        check(lines.count == 3, "three lines written (got \(lines.count))")
+        let obj = lines[0]
 
         check((obj["text"] as? String)?.lowercased().contains("country") == true,
               "transcript contains 'country' — got \(obj["text"] ?? "nil")")
         check(obj["source"] as? String == "mic", "source recorded as mic")
         check(obj["dur"] as? Double != nil, "duration recorded")
         check(obj["ts"] as? String != nil, "timestamp recorded")
+
+        check(obj["speaker"] as? String == "me", "mic line is 'me'")
+        // .infinity here would have thrown inside JSONEncoder and dropped the whole line.
+        check(obj["dist"] == nil, "mic line carries no distance")
+
+        let expected = book == nil ? "unknown" : "user-1"
+        check(lines[1]["speaker"] as? String == expected,
+              "first system line is \(expected) (got \(lines[1]["speaker"] ?? "nil"))")
+        check(lines[2]["speaker"] as? String == expected,
+              "same voice matched again, not re-enrolled (got \(lines[2]["speaker"] ?? "nil"))")
+
+        if book != nil {
+            check(lines[1]["dist"] == nil, "a new speaker records no distance")
+            guard let d = lines[2]["dist"] as? Double else {
+                print("  FAIL  matched line records no distance"); exit(1)
+            }
+            check(d < 0.3, "self-distance is a confident match (got \(d))")
+
+            // The whole point of the gallery: identity outlives the process.
+            guard let reopened = SpeakerBook(models: models, threshold: 0.65, url: gallery)
+            else { print("  FAIL  could not reopen gallery"); exit(1) }
+            let tail = Array(pcm[(pcm.count / 2)...])
+            check(reopened.label(tail)?.name == "user-1",
+                  "reloaded gallery still matches a later slice of the same voice")
+
+            // Catches the one failure every check above would survive: an embedder
+            // returning a constant vector, collapsing everyone into user-1. Dropping
+            // every 6th sample raises rate and pitch ~1.2x, which moves the formants.
+            var pitched: [Float] = []
+            for (i, v) in pcm.enumerated() where i % 6 != 0 { pitched.append(v) }
+            check(reopened.label(pitched)?.name == "user-2",
+                  "a different voice becomes a different speaker")
+        }
 
         try? FileManager.default.removeItem(at: out)
         print("all checks passed")

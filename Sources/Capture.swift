@@ -13,6 +13,11 @@ struct Config {
     var silenceMs = 700
     var maxSegmentSec = 25.0
 
+    /// Max cosine distance for two segments to count as the same person. Hardware- and
+    /// codec-dependent like `rmsThreshold`: FluidAudio suggests 0.6–0.7 for clean audio
+    /// and 0.7–0.8 for noisy, and a conference codec counts as noisy.
+    var speakerThreshold: Float = 0.65
+
     /// Hand-rolled rather than Decodable: a custom `init(from:)` would need an explicit
     /// CodingKeys enum to tolerate partial JSON, which is more code than this.
     static func load() -> Config {
@@ -25,6 +30,7 @@ struct Config {
         if let v = o["rmsThreshold"] as? Double { c.rmsThreshold = Float(v) }
         if let v = o["silenceMs"] as? Int { c.silenceMs = v }
         if let v = o["maxSegmentSec"] as? Double { c.maxSegmentSec = v }
+        if let v = o["speakerThreshold"] as? Double { c.speakerThreshold = Float(v) }
         return c
     }
 }

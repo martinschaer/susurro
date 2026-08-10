@@ -4,6 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 W=vendor/whisper.cpp
+FA=vendor/fluidaudio
+FA_TAG=v0.15.5
+FA_REL="$FA/.build/arm64-apple-macosx/release"
+SWIFT="$HOME/.swiftly/bin/swift"
 M="$HOME/.susurro/models"
 HF=https://huggingface.co
 mkdir -p "$M" "$HOME/.susurro/transcripts"
@@ -35,7 +39,32 @@ if [ ! -f "$W/build-mac/src/libwhisper.a" ]; then
   cmake --build "$W/build-mac" -j
 fi
 
-# 3. models
+# 3. FluidAudio, for speaker embeddings.
+# SwiftPM is used here and nowhere else — purely to produce a static lib, exactly like
+# cmake does for whisper above. The app itself still builds with plain swiftc.
+# It needs a swift.org toolchain: the CommandLineTools SwiftPM cannot link its own
+# manifests (see SETUP.md), so bare `swift` is not good enough.
+if [ ! -d "$FA" ]; then
+  echo "cloning FluidAudio $FA_TAG"
+  git clone --depth 1 --branch "$FA_TAG" https://github.com/FluidInference/FluidAudio "$FA"
+fi
+
+if [ ! -f "$FA_REL/libFluidAudio.a" ]; then
+  [ -x "$SWIFT" ] || {
+    echo "missing $SWIFT — install swiftly; CommandLineTools' SwiftPM cannot build this"
+    exit 1
+  }
+  echo "building FluidAudio"
+  (cd "$FA" && "$SWIFT" build -c release --product FluidAudio)
+  # SwiftPM emits loose objects for a library product, never an archive. Roll them up
+  # with the two C wrapper targets so the Makefile links one file.
+  libtool -static -o "$FA_REL/libFluidAudio.a" \
+    "$FA_REL"/FluidAudio.build/*.o \
+    "$FA_REL"/FastClusterWrapper.build/*.o \
+    "$FA_REL"/MachTaskSelfWrapper.build/*.o
+fi
+
+# 4. models
 fetch "$HF/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin" "$M/ggml-tiny.bin"
 fetch "$HF/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" "$M/ggml-silero-v5.1.2.bin"
 fetch "$HF/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" "$M/ggml-large-v3-turbo.bin"
@@ -48,6 +77,17 @@ if [ ! -d "$M/ggml-large-v3-turbo-encoder.mlmodelc" ]; then
   echo "unzipping Core ML encoder"
   unzip -q -o "$M/turbo-encoder.zip" -d "$M" && rm -rf "$M/turbo-encoder.zip" "$M/__MACOSX"
 fi
+
+# Speaker embedding models. FluidAudio would fetch these itself on first use, but an
+# always-on recorder must not block on the network mid-session, so pull them up front.
+# .mlmodelc is a directory, hence the inner loop.
+for m in pyannote_segmentation wespeaker_v2; do
+  mkdir -p "$M/$m.mlmodelc/analytics" "$M/$m.mlmodelc/weights"
+  for f in analytics/coremldata.bin coremldata.bin metadata.json model.mil weights/weight.bin; do
+    fetch "$HF/FluidInference/speaker-diarization-coreml/resolve/main/$m.mlmodelc/$f" \
+          "$M/$m.mlmodelc/$f"
+  done
+done
 
 echo
 echo "done. next: make smoke && make run"

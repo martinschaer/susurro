@@ -7,23 +7,41 @@ CommandLineTools **without** Xcode.app) and is reported as it behaved.
 
 | Tool | State | Consequence |
 |---|---|---|
-| `swiftc` | works | app + smoke build directly, no build system |
+| `~/.swiftly/bin/swiftc` | works | app + smoke build directly, no build system |
+| `/usr/bin/swiftc` (CLT) | works, **but** | cannot read swiftly-built modules — see below |
 | `cmake` + Accelerate + CoreML | works | whisper static libs build fine |
 | `xcodebuild` | **absent** | `build-xcframework.sh` unusable; no Xcode GUI fallback |
 | `xcrun metal` | **absent** | must build `-DGGML_METAL=OFF` |
-| SwiftPM | **broken** | `swift package init` output does not build (see below) |
+| SwiftPM, CLT's | **broken** | `swift package init` output does not build (see below) |
+| SwiftPM, swiftly's | works | used once, to vendor FluidAudio as a `.a` |
 
-The SwiftPM failure is not caused by our manifest. `libPackageDescription.dylib` in this
-CLT exports only `swiftLanguageModes:`/`swiftLanguageVersions: [SwiftLanguageMode]?`
+The CLT SwiftPM failure is not caused by our manifest. `libPackageDescription.dylib` in
+this CLT exports only `swiftLanguageModes:`/`swiftLanguageVersions: [SwiftLanguageMode]?`
 overloads, while the shipped `PackageDescription.swiftmodule` references
-`[SwiftVersion]?`, so every manifest fails to link:
+`[SwiftVersion]?`, so **every** manifest fails to link — a hand-written four-line one
+included:
 
 ```
 Undefined symbols: PackageDescription.Package.__allocating_init(… swiftLanguageVersions: [SwiftVersion]? …)
 ```
 
-**So: no `Package.swift` anywhere in this project.** Installing full Xcode would fix
-SwiftPM, `xcodebuild`, and Metal — but nothing here needs it, so it stays optional.
+A swift.org toolchain via [swiftly](https://swiftlang.github.io/swiftly/) ships its own
+working SwiftPM, which is how `vendor/fluidaudio` gets built. It does **not** ship `metal`
+or `xcodebuild` — those still need Xcode.app, and `-DGGML_METAL=OFF` still stands.
+
+**The two compilers are not interchangeable.** Both report 6.3.3, but they are different
+builds, and CLT's rejects the `.swiftmodule` swiftly's SwiftPM produced:
+
+```
+error: compiled module was created by an older version of the compiler; rebuild 'FluidAudio'
+```
+
+So the Makefile pins `$(HOME)/.swiftly/bin/swiftc`. Whatever builds `vendor/fluidaudio`
+must also build the app.
+
+**Still no `Package.swift` in this project.** SwiftPM is a vendoring tool here, the same
+way cmake is: it runs inside `vendor/fluidaudio` to emit a static lib, and the app links
+that lib with plain `swiftc`.
 
 ## 1. Models
 
@@ -35,6 +53,12 @@ SwiftPM, `xcodebuild`, and Metal — but nothing here needs it, so it stays opti
 | `ggml-large-v3-turbo-encoder.mlmodelc` (unzip) | same repo, `.mlmodelc.zip` | ~600 MB |
 | `ggml-silero-v5.1.2.bin` | `ggml-org/whisper-vad` | ~1 MB |
 | `ggml-tiny.bin` | `ggerganov/whisper.cpp` | 74 MB — smoke test only |
+| `pyannote_segmentation.mlmodelc` | `FluidInference/speaker-diarization-coreml` | ~6 MB |
+| `wespeaker_v2.mlmodelc` | same repo | ~8 MB |
+
+The two `.mlmodelc` directories are the speaker embedding pipeline. FluidAudio would
+download them itself on first use; `setup.sh` pulls them up front so an always-on recorder
+never blocks on the network mid-session. Model licence is `cc-by-4.0`, SDK Apache 2.0.
 
 The Core ML encoder **must** sit beside the `.bin` as `<model>-encoder.mlmodelc`;
 whisper.cpp derives that path by string surgery and silently falls back to CPU when it is
@@ -71,26 +95,57 @@ build-mac/src/libwhisper.coreml.a   build-mac/ggml/src/libggml-base.a
 > Homebrew's `whisper-cpp` bottle is unusable here: the formula sets
 > `-DWHISPER_BUILD_SERVER=OFF` and installs CLI binaries, not linkable libraries.
 
-## 3. Build the app
+## 3. FluidAudio static lib
+
+Speaker embeddings come from FluidAudio, pinned to `v0.15.5`. It is SwiftPM-only, so
+SwiftPM builds it — out of tree, into one archive:
+
+```bash
+git clone --depth 1 --branch v0.15.5 \
+  https://github.com/FluidInference/FluidAudio vendor/fluidaudio
+cd vendor/fluidaudio && ~/.swiftly/bin/swift build -c release --product FluidAudio
+```
+
+SwiftPM emits loose objects for a library product, never an archive, so `setup.sh` rolls
+them plus the two C wrapper targets into one file:
+
+```bash
+R=.build/arm64-apple-macosx/release
+libtool -static -o $R/libFluidAudio.a \
+  $R/FluidAudio.build/*.o $R/FastClusterWrapper.build/*.o $R/MachTaskSelfWrapper.build/*.o
+```
+
+31 MB archive; it contributes ~7 MB to the linked binary after dead-stripping. `main`
+additionally pulls a remote `NemoTextProcessing.xcframework` and a Rust FST lib — `v0.15.5`
+does not, which is one reason to stay on the tag.
+
+## 4. Build the app
 
 No project file. Link line, verified end to end:
 
 ```bash
-swiftc -O -parse-as-library -target arm64-apple-macosx14.2 \
+~/.swiftly/bin/swiftc -O -parse-as-library -target arm64-apple-macosx14.2 \
   -import-objc-header bridge.h -I vendor/whisper.cpp/ggml/include \
+  -I vendor/fluidaudio/.build/arm64-apple-macosx/release/Modules \
+  -I vendor/fluidaudio/Sources/FastClusterWrapper/include \
+  -I vendor/fluidaudio/Sources/MachTaskSelfWrapper/include \
   Sources/SusurroApp.swift Sources/Capture.swift Sources/Transcriber.swift \
+  Sources/Speaker.swift \
   -Lvendor/whisper.cpp/build-mac/src \
   -Lvendor/whisper.cpp/build-mac/ggml/src \
   -Lvendor/whisper.cpp/build-mac/ggml/src/ggml-blas \
   -lwhisper -lwhisper.coreml -lggml -lggml-base -lggml-cpu -lggml-blas \
+  vendor/fluidaudio/.build/arm64-apple-macosx/release/libFluidAudio.a \
   -framework Accelerate -framework CoreML -framework SwiftUI -lc++ \
   -o Susurro.app/Contents/MacOS/Susurro
 ```
 
+`-lc++` was already there for whisper and is also what `FastClusterWrapper` needs.
+
 `-parse-as-library` is required — `@main` cannot coexist with top-level code. `smoke.swift`
 is top-level, so it compiles **without** the flag, as a second invocation.
 
-## 4. Bundle + sign
+## 5. Bundle + sign
 
 `make app` assembles the bundle by hand (verified to launch with a live menu bar item):
 
@@ -130,7 +185,7 @@ needs an Apple ID, not full Xcode.
 
 An **unsigned** bundle launches and then never receives the audio-capture prompt.
 
-## 5. First run
+## 6. First run
 
 ```bash
 make app && open Susurro.app
@@ -148,9 +203,9 @@ tail -f ~/.susurro/transcripts/$(date +%F).jsonl
 
 | | |
 |---|---|
-| `./setup.sh` | clone + cmake build + models (idempotent) |
+| `./setup.sh` | clone + cmake/SwiftPM builds + models (idempotent) |
 | `make app` | swiftc, bundle, ad-hoc sign |
-| `make smoke` | jfk.wav through the transcriber + segmenter assert |
+| `make smoke` | jfk.wav through the transcriber + segmenter and speaker asserts |
 | `make clean` | drop build output and `Susurro.app`; leaves `~/.susurro` alone |
 
 ## Verified
@@ -161,6 +216,12 @@ tail -f ~/.susurro/transcripts/$(date +%F).jsonl
   launches with a live menu bar item
 - `make smoke` passes: segmenter cuts 2 utterances from tone/silence/tone, emits nothing
   on silence, and `jfk.wav` round-trips through `Transcriber` to JSONL on disk
+- FluidAudio `v0.15.5` builds with swiftly's SwiftPM (130 s), `libtool`s into a 31 MB
+  archive, and links with plain `swiftc`; the app binary is 8.1 MB
+- speaker embeddings discriminate for real, not just structurally: two halves of `jfk.wav`
+  match each other at cosine distance **0.11 / 0.15**, while the same audio decimated to
+  ~1.2× pitch fails to match and mints a second speaker
+- the gallery round-trips — labels survive `close()` and a fresh `SpeakerBook`
 - language auto-detect works (`auto-detected language: en (p = 0.977611)`)
 - Core ML fallback is real: with no `-encoder.mlmodelc` present, whisper logs
   `failed to load Core ML model` and continues on CPU

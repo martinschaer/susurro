@@ -81,7 +81,10 @@ final class Engine {
         // ANE, measured at ~36 s here. macOS caches the result, so later loads are <1 s —
         // but that first one would freeze the menu bar solid.
         DispatchQueue.global(qos: .userInitiated).async {
-            let t = Transcriber(model: model, vad: vadURL)
+            // Missing speaker models must not cost you the transcript: without them every
+            // system line is simply labelled "unknown".
+            let book = SpeakerBook(models: models, threshold: cfg.speakerThreshold)
+            let t = Transcriber(model: model, vad: vadURL, speakers: book)
             DispatchQueue.main.async {
                 guard gen == self.generation, self.enabled else {
                     t?.close()                // toggled off mid-load; discard it
@@ -105,6 +108,7 @@ final class Engine {
 
                 // One source failing must not take the other down.
                 var failures: [String] = []
+                if book == nil { failures.append("speaker models missing — run ./setup.sh") }
                 do { try m.start() } catch {
                     failures.append("mic: \(error.localizedDescription)")
                 }

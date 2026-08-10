@@ -6,12 +6,13 @@ distribution.
 
 ## Scope
 
-**In:** mic capture, system-audio capture, local whisper.cpp transcription, menu bar
-on/off toggle, append-only daily JSONL transcripts in `~/.susurro/transcripts`.
+**In:** mic capture, system-audio capture, local whisper.cpp transcription, per-speaker
+labels on the system stream that persist across days, menu bar on/off toggle, append-only
+daily JSONL transcripts in `~/.susurro/transcripts`.
 
-**Out:** search UI, audio retention, diarization beyond mic-vs-system, summarization,
-sync, notifications, preferences window, launch-at-login, auto-update, tests beyond one
-smoke check.
+**Out:** search UI, audio retention, splitting two speakers *inside* one segment,
+summarization, sync, notifications, preferences window, launch-at-login, auto-update,
+tests beyond one smoke check.
 
 ## Decisions
 
@@ -24,6 +25,8 @@ smoke check.
 | ASR | whisper.cpp static `.a` libs, Core ML encoder | In-process C API; ANE encoder. No xcframework needed |
 | Model | `ggml-large-v3-turbo` + prebuilt Core ML encoder | Multilingual (ES/EN mixing), fast on M-series |
 | VAD | whisper.cpp built-in Silero v5.1.2 | Kills whisper's silence hallucinations |
+| Speakers | FluidAudio (pyannote community-1 + WeSpeaker) via Core ML | 256-d embeddings on the ANE; matching layer already tuned |
+| Speaker identity | Cosine match against `~/.susurro/speakers.json` | Diarizers renumber every run; only a persisted embedding survives the night |
 | Storage | `~/.susurro/transcripts/YYYY-MM-DD.jsonl` | Append-only, greppable |
 | Sandbox | **Off** | Sandboxed app can't write `~/.susurro` |
 
@@ -33,12 +36,19 @@ This machine has **CommandLineTools only, no Xcode.app**. Verified consequences:
 
 - `xcodebuild` absent → `build-xcframework.sh` cannot run, and there is no Xcode GUI fallback
 - `xcrun metal` absent → **`GGML_METAL=OFF`**; acceleration is Core ML (ANE) + Accelerate BLAS + NEON
-- **SwiftPM is broken** — even `swift package init` output fails to build, because
-  `libPackageDescription.dylib` exports only `SwiftLanguageMode` overloads while the
-  shipped `.swiftmodule` references `SwiftVersion`
+- **CommandLineTools' SwiftPM is broken** — even `swift package init` output fails to
+  build, because `libPackageDescription.dylib` exports only `SwiftLanguageMode` overloads
+  while the shipped `.swiftmodule` references `SwiftVersion`
 
-`swiftc` itself is fine. So: plain `cmake` for whisper's static libs, plain `swiftc` for
-the app, hand-assembled bundle. All three verified working (see SETUP.md § Verified).
+A **swiftly** toolchain (`~/.swiftly/bin`) ships a working SwiftPM, which is how
+`vendor/fluidaudio` becomes a static lib. It does not ship `metal` or `xcodebuild`, so the
+other two constraints stand. The two `swiftc` binaries both claim 6.3.3 but are different
+builds, and CLT's cannot read modules swiftly's SwiftPM produced — so the Makefile pins
+swiftly's for everything.
+
+So: `cmake` for whisper's libs, SwiftPM-out-of-tree for FluidAudio's, plain `swiftc` for
+the app, hand-assembled bundle. No `Package.swift` in this project. All verified working
+(see SETUP.md § Verified).
 
 Measured on `jfk.wav` (11.0 s of audio), Metal off:
 
@@ -64,13 +74,22 @@ Core Audio tap     ───┘   16 kHz mono f32      └── stream "system"
                             Transcriber (serial queue)
                             one whisper_context, VAD on
                                         │
-                                        ▼
+                          ┌─────────────┴──── source == "system"
+                          │                            │
+                          │                   SpeakerBook (embed + match)
+                          │                   ~/.susurro/speakers.json
+                          ▼                            │
+                          └────────────┬───────────────┘
+                                       ▼
                           ~/.susurro/transcripts/<date>.jsonl
 ```
 
 Two independent capture sources, one shared transcriber. A single `whisper_context` is
 not reentrant, so both streams funnel through one serial `DispatchQueue`. Segments are
 seconds long; queueing is fine and halves resident memory vs. two contexts.
+
+`SpeakerBook` hangs off the same queue, which is also what makes it thread-safe —
+`SpeakerManager` is a struct mutated in place, with no lock anywhere.
 
 ### Capture
 
@@ -141,17 +160,56 @@ params.n_threads           = 4
 `no_context = true` matters: with cross-segment context enabled, one bad transcription
 poisons every subsequent one in an always-on run.
 
+### Speakers
+
+`Segmenter` cuts on 700 ms of silence, and a conversational turn normally ends with a
+pause — so an emitted segment is usually one person. That removes the expensive half of
+diarization: embed the whole segment as a single speaker, no segmentation pass, no
+clustering. `DiarizerManager.extractSpeakerEmbedding` does exactly this, feeding an
+all-ones frame mask to WeSpeaker and returning a 256-d L2-normalized vector.
+
+`SpeakerManager` then cosine-matches it against the gallery, mints `user-N` on a miss, and
+refines the matched centroid by EMA. Defaults worth knowing:
+
+```
+speakerThreshold           = 0.65      // config.json; <0.3 is a confident match
+minSpeechDuration          = 1.0 s     // below this: match, never enroll
+minEmbeddingUpdateDuration = 2.0 s     // below this: match, never update the centroid
+```
+
+Those two floors are the guard against gallery rot. A sub-second grunt makes a bad
+centroid, and a bad centroid mismatches everything after it.
+
+**Clips are hard-capped at 10 s** before they reach the extractor. That is not a
+preference: the extractor copies its input into a `[3, 160000]` batch buffer with no
+clamp, so a longer clip writes over the neighbouring batch slots. Only slot 0 is read
+back, so trimming loses nothing.
+
+The gallery is written on new-speaker creation and on `close()` — never per segment.
+Losing a little centroid drift to a crash is cheap; losing a speaker is not.
+
+Missing speaker models degrade to `speaker:"unknown"` and a menu-bar note. They never cost
+you the transcript.
+
 ### Storage
 
 `~/.susurro/transcripts/YYYY-MM-DD.jsonl` (local date), one line per segment, opened
 `O_APPEND`, flushed per write:
 
 ```json
-{"ts":"2026-08-10T14:32:07+02:00","source":"mic","dur":3.42,"lang":"es","text":"…"}
+{"ts":"2026-08-10T14:32:07+02:00","source":"system","speaker":"user-2","dist":0.31,"dur":3.42,"lang":"es","text":"…"}
 ```
 
-`source` is `"mic"` (you) or `"system"` (what you heard). Directory created `0700` at
-launch. Empty-text results are not written.
+`source` is `"mic"` (you) or `"system"` (what you heard). `speaker` is `"me"` for the mic
+stream — no embedding beats knowing which microphone it came from — and `user-N`,
+a name from `speakers.json`, or `"unknown"` for the system stream.
+
+`dist` is the cosine distance to the matched speaker, and it is written **so that a bad
+day is re-clusterable offline** rather than baked into the transcript. It is absent when
+nothing matched, which is also a hard requirement: a miss reports `.infinity`, and
+`JSONEncoder` throws on non-finite doubles, which would silently drop the line.
+
+Directory created `0700` at launch. Empty-text results are not written.
 
 ## Menu bar
 
@@ -188,11 +246,16 @@ susurro/
     SusurroApp.swift    MenuBarExtra, enable/disable wiring
     Capture.swift       mic + system tap + segmenter
     Transcriber.swift   whisper context, serial queue, JSONL append
+    Speaker.swift       embedding + persisted gallery
     smoke.swift         built separately, not part of the app
   vendor/whisper.cpp/   shallow clone + build-mac/
+  vendor/fluidaudio/    shallow clone at v0.15.5 + .build/ (SwiftPM -> one .a)
 ```
 
-Three Swift files in the app. If a fourth appears, ask why.
+Four Swift files in the app. The fourth is `Speaker.swift`, and the why is that model
+loading plus a persisted gallery is a different lifecycle from the whisper context —
+inlining it would blur the one thing `Transcriber.swift` currently does well. If a fifth
+appears, ask why.
 
 `bridge.h` replaces a module map: `swiftc -import-objc-header bridge.h` exposes the whole
 whisper C API with no wrapper target and no `import` statement.
@@ -204,10 +267,17 @@ Bluetooth headset have different noise floors, and no fixed constant is right fo
 three. Expose it as `~/.susurro/config.json`:
 
 ```json
-{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25}
+{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.65}
 ```
 
+`speakerThreshold` is calibration for the same reason: what a conferencing codec does to a
+voice varies by platform, and 0.6–0.7 suits clean audio while 0.7–0.8 suits noisy. Raise it
+if one person keeps splitting into two `user-N`; lower it if two people keep merging.
+
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
+
+Naming is the same file-and-a-toggle story: edit `name` in `~/.susurro/speakers.json` from
+`Speaker 3` to `Ana` and every later day says `Ana`. Deliberately not a UI.
 
 ## Known limitations
 
@@ -215,7 +285,8 @@ Accepted for a prototype, listed so they are not rediscovered as bugs:
 
 1. **Speaker echo.** On speakers, the mic hears system audio, so the same speech lands
    twice — once as `mic`, once as `system`. Use headphones. A time-overlap suppressor is
-   the fix if it turns out to matter.
+   the fix if it turns out to matter. Speaker labels make this worse, not better: on
+   speakers your own voice also enrolls in the gallery as a `system` speaker.
 2. **TCC re-prompts.** With ad-hoc signing the cdhash changes on every rebuild and macOS
    may re-ask for permission. An Apple Development certificate makes it stable.
 3. **Battery.** large-v3-turbo on the ANE for an 8-hour day is real power draw. Drop to
@@ -224,7 +295,22 @@ Accepted for a prototype, listed so they are not rediscovered as bugs:
    the start, nothing covers the end.
 5. **Language auto-detect per segment** can flip mid-conversation on short utterances.
    Pin `params.language` if the mixing is not actually needed.
-6. **No crash recovery.** Buffered, un-flushed audio is lost on quit or crash.
+6. **No crash recovery.** Buffered, un-flushed audio is lost on quit or crash, along
+   with centroid drift since the last new speaker.
+7. **Two speakers in one segment** get one label — whoever the averaged embedding lands
+   nearest. The RMS gate cuts on silence, and interruptions do not have any. The fix is to
+   run `pyannote_segmentation` on the segment and split it, roughly doubling the pipeline;
+   gate that on evidence from real transcripts, not on principle.
+8. **Cross-day identity degrades.** Same call, same day is the easy case. Across days,
+   low-bitrate Opus, noise suppression and AGC distort exactly the spectral detail the
+   embedding keys on — the same person on Zoom vs. in the room can land further apart than
+   two different people on one platform. Expect it to hold for 5–10 recurring colleagues
+   and to start false-merging as strangers accumulate, since each false merge poisons a
+   centroid and causes the next. `dist` in the JSONL is there so a bad stretch can be
+   re-clustered offline.
+9. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
+   not to this. It lives at `0700`/`0600` beside the transcripts, and deleting the file
+   forgets everyone.
 
 ## Verification
 
@@ -233,10 +319,18 @@ One check, `make smoke`: feed `samples/jfk.wav` (ships with whisper.cpp) through
 that a synthetic tone-silence-tone buffer produces exactly 2 segments. Fails loudly if
 either the model wiring or the gate logic breaks. No framework, no fixtures.
 
+The same audio also goes down the `system` stream twice, asserting `me` / `user-1` /
+`user-1` — minting and matching are different branches — that the gallery survives a
+reopen, and that a decimated (~1.2× pitch) copy becomes `user-2`. That last one is the
+only check that catches an embedder returning a constant vector, which would collapse
+everyone into `user-1` while every other assertion still passed.
+
 Both targets build with `-parse-as-library` and carry their own `@main`; `smoke.swift`
 links `Capture.swift` + `Transcriber.swift` instead of `SusurroApp.swift`. Top-level code
 is only legal in a file literally named `main.swift` once more than one file is being
 compiled, so `@main` is the path of least resistance for both.
 
 Manual acceptance: enable → say something → play a YouTube clip → confirm today's JSONL
-has both a `mic` and a `system` line with sane text.
+has both a `mic` and a `system` line with sane text, the mic lines say `me`, and the clip's
+voices got `user-N`. Then join a call with two other people and check the two of them do
+not collapse into one `user-N` — if they do, lower `speakerThreshold`.

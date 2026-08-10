@@ -8,6 +8,9 @@ vendor/
 # Interrupted downloads from setup.sh
 *.part
 
+# Written by swiftly; the Makefile pins the toolchain path anyway
+.swift-version
+
 # Per-machine Claude Code settings
 .claude/settings.local.json
 

@@ -10,6 +10,9 @@ final class Transcriber {
     private let queue = DispatchQueue(label: "dev.susurro.whisper", qos: .utility)
     private let dir: URL
 
+    // Touched only from `queue`, which is what keeps it single-threaded.
+    private let speakers: SpeakerBook?
+
     // whisper stores these as `const char *` without copying, so they must outlive
     // every whisper_full call — hence strdup rather than a Swift String.
     private let vadPath: UnsafeMutablePointer<CChar>?
@@ -33,13 +36,15 @@ final class Transcriber {
         return f
     }()
 
-    init?(model: URL, vad: URL?, dir: URL = Transcriber.defaultDir) {
+    init?(model: URL, vad: URL?, speakers: SpeakerBook? = nil,
+          dir: URL = Transcriber.defaultDir) {
         var cp = whisper_context_default_params()
         cp.use_gpu = true              // Metal is off at build time; the Core ML
                                        // encoder path is selected independently
         guard let c = whisper_init_from_file_with_params(model.path, cp) else { return nil }
         ctx = c
         self.dir = dir
+        self.speakers = speakers
         vadPath = vad.flatMap { strdup($0.path) }
         autoLang = strdup("auto")
         try? FileManager.default.createDirectory(
@@ -61,6 +66,7 @@ final class Transcriber {
         queue.sync {}
         guard !closed else { return }
         closed = true
+        speakers?.close()             // safe after the sync above: the queue is drained
         whisper_free(ctx)
         try? handle?.close()
         handle = nil
@@ -100,16 +106,32 @@ final class Transcriber {
         guard !text.isEmpty else { return }
 
         let lang = String(cString: whisper_lang_str(whisper_full_lang_id(ctx)))
-        append(text, source: source, dur: Double(samples.count) / 16000, lang: lang)
+
+        // "mic" is you — a fact no embedding can improve on. Only the system stream needs
+        // matching. Doing it after the empty-text guard means the gallery only ever learns
+        // from audio whisper agreed was speech.
+        var speaker = "me"
+        var dist: Float?
+        if source == "system" {
+            let match = speakers?.label(samples)
+            speaker = match?.name ?? "unknown"
+            dist = match?.dist
+        }
+
+        append(text, source: source, speaker: speaker, dist: dist,
+               dur: Double(samples.count) / 16000, lang: lang)
     }
 
     // MARK: - storage
 
     private struct Line: Encodable {
-        let ts: String, source: String, dur: Double, lang: String, text: String
+        let ts: String, source: String, speaker: String
+        let dist: Double?
+        let dur: Double, lang: String, text: String
     }
 
-    private func append(_ text: String, source: String, dur: Double, lang: String) {
+    private func append(_ text: String, source: String, speaker: String, dist: Float?,
+                        dur: Double, lang: String) {
         let now = Date()
         let day = Self.dayFmt.string(from: now)
         if day != handleDay || handle == nil {
@@ -117,8 +139,12 @@ final class Transcriber {
             handle = Self.openDay(day, in: dir)
             handleDay = day
         }
-        let line = Line(ts: Self.isoFmt.string(from: now), source: source,
-                        dur: (dur * 100).rounded() / 100, lang: lang, text: text)
+        // A miss reports .infinity, and JSONEncoder *throws* on non-finite doubles — which
+        // the `try?` below would turn into a silently dropped line, for every speaker's
+        // first appearance. Omit the field instead.
+        let d = dist.map(Double.init).flatMap { $0.isFinite ? ($0 * 1000).rounded() / 1000 : nil }
+        let line = Line(ts: Self.isoFmt.string(from: now), source: source, speaker: speaker,
+                        dist: d, dur: (dur * 100).rounded() / 100, lang: lang, text: text)
         guard let data = try? JSONEncoder().encode(line), let h = handle else { return }
         h.write(data)
         h.write(Data([0x0a]))

@@ -8,6 +8,12 @@ posts.
 original reasoning and the reversal are both kept below, since the *reason* B was
 recommended was a toolchain accident, not a technical judgement about the libraries.
 
+> **Status: steps 0 and 1 are implemented** on option C — see SPEC.md § Speakers.
+> `speaker` and `dist` are in the JSONL, the gallery lives at `~/.susurro/speakers.json`,
+> and `make smoke` covers minting, matching, reload, and discrimination. Steps 2 (naming)
+> and 3 (splitting a segment) are not built; step 2 is already usable by hand-editing
+> `name` in `speakers.json`.
+
 ## The short version
 
 **Recommendation: use the FluidAudio SDK (option C).** With swiftly installed, SwiftPM works,
