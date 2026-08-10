@@ -84,7 +84,8 @@ final class Engine {
             // Missing speaker models must not cost you the transcript: without them every
             // system line is simply labelled "unknown".
             let book = SpeakerBook(models: models, threshold: cfg.speakerThreshold)
-            let t = Transcriber(model: model, vad: vadURL, speakers: book)
+            let t = Transcriber(model: model, vad: vadURL, speakers: book,
+                                gapSec: cfg.sessionGapMin * 60)
             DispatchQueue.main.async {
                 guard gen == self.generation, self.enabled else {
                     t?.close()                // toggled off mid-load; discard it

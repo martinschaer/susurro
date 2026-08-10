@@ -18,6 +18,10 @@ struct Config {
     /// and 0.7–0.8 for noisy, and a conference codec counts as noisy.
     var speakerThreshold: Float = 0.65
 
+    /// Silence on both streams for longer than this starts a new transcript file, so one
+    /// file is one meeting. Toggling Listening off/on always starts a new one too.
+    var sessionGapMin = 5.0
+
     /// Hand-rolled rather than Decodable: a custom `init(from:)` would need an explicit
     /// CodingKeys enum to tolerate partial JSON, which is more code than this.
     static func load() -> Config {
@@ -31,6 +35,7 @@ struct Config {
         if let v = o["silenceMs"] as? Int { c.silenceMs = v }
         if let v = o["maxSegmentSec"] as? Double { c.maxSegmentSec = v }
         if let v = o["speakerThreshold"] as? Double { c.speakerThreshold = Float(v) }
+        if let v = o["sessionGapMin"] as? Double { c.sessionGapMin = v }
         return c
     }
 }

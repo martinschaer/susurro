@@ -196,7 +196,8 @@ audio). Later fixable in System Settings ▸ Privacy & Security ▸ Microphone a
 System Audio Recording.
 
 ```bash
-tail -f ~/.susurro/transcripts/$(date +%F).jsonl
+# one file per meeting, named for its first line — follow the newest
+tail -f "$(ls -t ~/.susurro/transcripts/*.jsonl | head -1)"
 ```
 
 ## Commands

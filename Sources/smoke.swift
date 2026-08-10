@@ -70,12 +70,18 @@ enum Smoke {
         t.submit(pcm, source: "system")
         t.close()                                   // drains the queue, flushes the gallery
 
-        let day = DateFormatter()
-        day.dateFormat = "yyyy-MM-dd"
-        day.locale = Locale(identifier: "en_US_POSIX")
-        let jsonl = out.appendingPathComponent("\(day.string(from: Date())).jsonl")
-        guard let written = try? String(contentsOf: jsonl, encoding: .utf8) else {
-            print("  FAIL  no JSONL written to \(jsonl.path)"); exit(1)
+        func transcripts() -> [URL] {
+            let all = try? FileManager.default.contentsOfDirectory(
+                at: out, includingPropertiesForKeys: nil)
+            return (all ?? []).filter { $0.pathExtension == "jsonl" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }
+
+        // Three submits seconds apart are one meeting, hence one file.
+        check(transcripts().count == 1,
+              "one transcript file for one session (got \(transcripts().count))")
+        guard let written = try? String(contentsOf: transcripts()[0], encoding: .utf8) else {
+            print("  FAIL  no JSONL written to \(out.path)"); exit(1)
         }
         let lines = written.split(separator: "\n").compactMap {
             try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
@@ -121,6 +127,17 @@ enum Smoke {
             check(reopened.label(pitched)?.name == "user-2",
                   "a different voice becomes a different speaker")
         }
+
+        // A gap longer than `gapSec` starts a new file. gapSec: 0 makes any elapsed time
+        // count as a gap; the sleep is only so the name lands in a different second.
+        sleep(1)
+        guard let t2 = Transcriber(model: model, vad: nil, gapSec: 0, dir: out) else {
+            print("  FAIL  reopen for gap check"); exit(1)
+        }
+        t2.submit(pcm, source: "mic")
+        t2.close()
+        check(transcripts().count == 2,
+              "a silence gap starts a second file (got \(transcripts().count))")
 
         try? FileManager.default.removeItem(at: out)
         print("all checks passed")

@@ -18,26 +18,32 @@ final class Transcriber {
     private let vadPath: UnsafeMutablePointer<CChar>?
     private let autoLang: UnsafeMutablePointer<CChar>
 
+    /// Silence longer than this on both streams ends the file. See `append`.
+    private let gapSec: Double
+
     private var handle: FileHandle?
-    private var handleDay = ""
+    private var lastWrite = Date.distantPast
     private var closed = false
 
-    private static let dayFmt: DateFormatter = {
+    /// Seconds, not minutes: an off/on inside the same minute must not reopen the
+    /// previous session's file.
+    private static let fileFmt: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         f.locale = Locale(identifier: "en_US_POSIX")
         return f
     }()
 
     private static let isoFmt: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
-        f.timeZone = .current          // local offset, not Z — matches the day file
+        f.timeZone = .current          // local offset, not Z — matches the file name
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
 
-    init?(model: URL, vad: URL?, speakers: SpeakerBook? = nil,
+    init?(model: URL, vad: URL?, speakers: SpeakerBook? = nil, gapSec: Double = 300,
           dir: URL = Transcriber.defaultDir) {
+        self.gapSec = gapSec
         var cp = whisper_context_default_params()
         cp.use_gpu = true              // Metal is off at build time; the Core ML
                                        // encoder path is selected independently
@@ -132,13 +138,16 @@ final class Transcriber {
 
     private func append(_ text: String, source: String, speaker: String, dist: Float?,
                         dur: Double, lang: String) {
+        // One file per meeting. Nothing runs while nobody is talking, so the gap between
+        // this line and the last one *is* the silence measurement — no timer needed. A
+        // session that spans midnight stays in one file, named for its first line.
         let now = Date()
-        let day = Self.dayFmt.string(from: now)
-        if day != handleDay || handle == nil {
+        if handle == nil || now.timeIntervalSince(lastWrite) > gapSec {
             try? handle?.close()
-            handle = Self.openDay(day, in: dir)
-            handleDay = day
+            handle = Self.openFile(Self.fileFmt.string(from: now), in: dir)
         }
+        lastWrite = now                // before the guard below: a dropped line must not
+                                       // strand the clock at the previous session
         // A miss reports .infinity, and JSONEncoder *throws* on non-finite doubles — which
         // the `try?` below would turn into a silently dropped line, for every speaker's
         // first appearance. Omit the field instead.
@@ -151,8 +160,8 @@ final class Transcriber {
         try? h.synchronize()
     }
 
-    private static func openDay(_ day: String, in dir: URL) -> FileHandle? {
-        let url = dir.appendingPathComponent("\(day).jsonl")
+    private static func openFile(_ stamp: String, in dir: URL) -> FileHandle? {
+        let url = dir.appendingPathComponent("\(stamp).jsonl")
         let fm = FileManager.default
         if !fm.fileExists(atPath: url.path) {
             fm.createFile(atPath: url.path, contents: nil,

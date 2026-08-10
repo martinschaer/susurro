@@ -8,7 +8,7 @@ distribution.
 
 **In:** mic capture, system-audio capture, local whisper.cpp transcription, per-speaker
 labels on the system stream that persist across days, menu bar on/off toggle, append-only
-daily JSONL transcripts in `~/.susurro/transcripts`.
+per-meeting JSONL transcripts in `~/.susurro/transcripts`.
 
 **Out:** search UI, audio retention, splitting two speakers *inside* one segment,
 summarization, sync, notifications, preferences window, launch-at-login, auto-update,
@@ -27,7 +27,7 @@ tests beyond one smoke check.
 | VAD | whisper.cpp built-in Silero v5.1.2 | Kills whisper's silence hallucinations |
 | Speakers | FluidAudio (pyannote community-1 + WeSpeaker) via Core ML | 256-d embeddings on the ANE; matching layer already tuned |
 | Speaker identity | Cosine match against `~/.susurro/speakers.json` | Diarizers renumber every run; only a persisted embedding survives the night |
-| Storage | `~/.susurro/transcripts/YYYY-MM-DD.jsonl` | Append-only, greppable |
+| Storage | `~/.susurro/transcripts/YYYY-MM-DD_HH-MM-SS.jsonl` | Append-only, greppable, one file per meeting |
 | Sandbox | **Off** | Sandboxed app can't write `~/.susurro` |
 
 ## Toolchain constraint
@@ -81,7 +81,7 @@ Core Audio tap     ───┘   16 kHz mono f32      └── stream "system"
                           ▼                            │
                           └────────────┬───────────────┘
                                        ▼
-                          ~/.susurro/transcripts/<date>.jsonl
+                          ~/.susurro/transcripts/<date_time>.jsonl
 ```
 
 Two independent capture sources, one shared transcriber. A single `whisper_context` is
@@ -193,8 +193,8 @@ you the transcript.
 
 ### Storage
 
-`~/.susurro/transcripts/YYYY-MM-DD.jsonl` (local date), one line per segment, opened
-`O_APPEND`, flushed per write:
+`~/.susurro/transcripts/YYYY-MM-DD_HH-MM-SS.jsonl` (local time of the file's first line),
+one line per segment, appended, `fsync`ed per write:
 
 ```json
 {"ts":"2026-08-10T14:32:07+02:00","source":"system","speaker":"user-2","dist":0.31,"dur":3.42,"lang":"es","text":"…"}
@@ -210,6 +210,13 @@ nothing matched, which is also a hard requirement: a miss reports `.infinity`, a
 `JSONEncoder` throws on non-finite doubles, which would silently drop the line.
 
 Directory created `0700` at launch. Empty-text results are not written.
+
+One file is one meeting, not one day. A new file starts when Listening is toggled on, and
+whenever neither stream produced speech for longer than `sessionGapMin` (default 5). The
+split needs no timer: nothing runs during silence, so the gap between one written line and
+the next *is* the measurement. A meeting that crosses midnight stays in one file — the
+file is named for its first line, and `ts` carries the real date of every line. Files are
+created on first write, so a session where nobody spoke leaves nothing behind.
 
 ## Menu bar
 
@@ -267,12 +274,17 @@ Bluetooth headset have different noise floors, and no fixed constant is right fo
 three. Expose it as `~/.susurro/config.json`:
 
 ```json
-{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.65}
+{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.65,
+ "sessionGapMin": 5}
 ```
 
 `speakerThreshold` is calibration for the same reason: what a conferencing codec does to a
 voice varies by platform, and 0.6–0.7 suits clean audio while 0.7–0.8 suits noisy. Raise it
 if one person keeps splitting into two `user-N`; lower it if two people keep merging.
+
+`sessionGapMin` is where a transcript file ends: minutes of silence on both streams before
+the next line goes to a new file. Too low and one meeting with a long lull becomes two
+files; too high and two back-to-back meetings become one.
 
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
 
@@ -330,7 +342,7 @@ links `Capture.swift` + `Transcriber.swift` instead of `SusurroApp.swift`. Top-l
 is only legal in a file literally named `main.swift` once more than one file is being
 compiled, so `@main` is the path of least resistance for both.
 
-Manual acceptance: enable → say something → play a YouTube clip → confirm today's JSONL
+Manual acceptance: enable → say something → play a YouTube clip → confirm the newest JSONL
 has both a `mic` and a `system` line with sane text, the mic lines say `me`, and the clip's
 voices got `user-N`. Then join a call with two other people and check the two of them do
 not collapse into one `user-N` — if they do, lower `speakerThreshold`.
