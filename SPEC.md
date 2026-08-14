@@ -172,13 +172,26 @@ all-ones frame mask to WeSpeaker and returning a 256-d L2-normalized vector.
 refines the matched centroid by EMA. Defaults worth knowing:
 
 ```
-speakerThreshold           = 0.65      // config.json; <0.3 is a confident match
+speakerThreshold           = 0.45      // config.json; <0.3 is a confident match
+embeddingThreshold         = 0.25      // config.json; above this a match does not
+                                       //   refine the centroid, only its duration
 minSpeechDuration          = 1.0 s     // below this: match, never enroll
 minEmbeddingUpdateDuration = 2.0 s     // below this: match, never update the centroid
 ```
 
 Those two floors are the guard against gallery rot. A sub-second grunt makes a bad
 centroid, and a bad centroid mismatches everything after it.
+
+`embeddingThreshold` is the guard against the slower rot, and FluidAudio's 0.45 default is
+wrong for a gallery that lives for weeks. Every match under it EMA-blends the segment into
+the stored voiceprint at `alpha: 0.9`. Measured p50 distance on real calls is 0.23, so at
+0.45 nearly every segment rewrites the centroid: it walks toward whoever is speaking now,
+converges on the average voice in the room, and from then on sits within `speakerThreshold`
+of everybody — so `assignSpeaker` never takes the create branch again. Five days of real
+meetings produced two entries whose own stored exemplars were further apart (p50 0.449)
+than the two entries were from each other (0.423). Offline clustering of those same
+exemplars finds six to eleven voices. Keep the blend rare and the voiceprint stays the
+person who enrolled it.
 
 **Clips are hard-capped at 10 s** before they reach the extractor. That is not a
 preference: the extractor copies its input into a `[3, 160000]` batch buffer with no
@@ -226,6 +239,7 @@ created on first write, so a session where nobody spoke leaves nothing behind.
 [✓] Listening          ⌘L      → toggles capture
     ─────────────────
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
+    Name speakers…             → one Window scene, one text field per voice
     ─────────────────
     Quit Susurro       ⌘Q
 ```
@@ -274,13 +288,18 @@ Bluetooth headset have different noise floors, and no fixed constant is right fo
 three. Expose it as `~/.susurro/config.json`:
 
 ```json
-{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.65,
- "sessionGapMin": 5}
+{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.45,
+ "embeddingThreshold": 0.25, "sessionGapMin": 5}
 ```
 
 `speakerThreshold` is calibration for the same reason: what a conferencing codec does to a
-voice varies by platform, and 0.6–0.7 suits clean audio while 0.7–0.8 suits noisy. Raise it
-if one person keeps splitting into two `user-N`; lower it if two people keep merging.
+voice varies by platform. FluidAudio suggests 0.6–0.8, but that is tuned for clustering one
+recording; a gallery that has to still be right next month wants tighter. Raise it if one
+person keeps splitting into two `user-N`; lower it if two people keep merging. Splitting is
+the better failure — type the same name into both entries and they read as one person,
+whereas nothing recovers a transcript that filed two people under one.
+
+`embeddingThreshold` should stay well under it, for the reason above.
 
 `sessionGapMin` is where a transcript file ends: minutes of silence on both streams before
 the next line goes to a new file. Too low and one meeting with a long lull becomes two
@@ -288,8 +307,14 @@ files; too high and two back-to-back meetings become one.
 
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
 
-Naming is the same file-and-a-toggle story: edit `name` in `~/.susurro/speakers.json` from
-`Speaker 3` to `Ana` and every later day says `Ana`. Deliberately not a UI.
+Naming is not: *Name speakers…* lists the gallery, one text field per voice labelled with
+the `user-N` the transcripts use, and every later line says `Ana`. Hand-editing `name` in
+`~/.susurro/speakers.json` still works and is the same operation — the window is only a
+read-modify-write of that file, which is why it needs no models loaded and works with
+Listening off. `SpeakerBook` re-reads the names before it writes, so a rename survives the
+running session flushing its drifted centroids; it reaches the live labels at that flush,
+not the instant you click Save. Lines already written keep the old label — the transcripts
+are append-only.
 
 ## Known limitations
 
@@ -345,4 +370,10 @@ compiled, so `@main` is the path of least resistance for both.
 Manual acceptance: enable → say something → play a YouTube clip → confirm the newest JSONL
 has both a `mic` and a `system` line with sane text, the mic lines say `me`, and the clip's
 voices got `user-N`. Then join a call with two other people and check the two of them do
-not collapse into one `user-N` — if they do, lower `speakerThreshold`.
+not collapse into one `user-N` — if they do, lower `speakerThreshold`, and check
+`embeddingThreshold` is not letting the centroids wander.
+
+That collapse is not reproducible in `smoke.swift`: it needs hundreds of genuinely
+different voices, and one `jfk.wav` pitch-shifted cannot fake them. The smoke check covers
+the knob (at 0 no match may touch a stored voiceprint, at 1 every match must); the
+behaviour itself is checked against `speakers.json` after a real call.

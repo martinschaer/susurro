@@ -14,9 +14,16 @@ struct Config {
     var maxSegmentSec = 25.0
 
     /// Max cosine distance for two segments to count as the same person. Hardware- and
-    /// codec-dependent like `rmsThreshold`: FluidAudio suggests 0.6–0.7 for clean audio
-    /// and 0.7–0.8 for noisy, and a conference codec counts as noisy.
-    var speakerThreshold: Float = 0.65
+    /// codec-dependent like `rmsThreshold`. FluidAudio suggests 0.6–0.8, tuned for one
+    /// recording; a gallery that lives for weeks needs tighter, or every voice ends up in
+    /// the first entry. Raise it if one person keeps splitting into two `user-N`.
+    var speakerThreshold: Float = 0.45
+
+    /// Max distance for a match to also drag the stored voiceprint toward it. Below
+    /// FluidAudio's 0.45 default on purpose: measured p50 distance on real calls is 0.23,
+    /// so at 0.45 nearly every segment rewrites the centroid — and a centroid that follows
+    /// the room becomes the average voice in it, which then matches everybody.
+    var embeddingThreshold: Float = 0.25
 
     /// Silence on both streams for longer than this starts a new transcript file, so one
     /// file is one meeting. Toggling Listening off/on always starts a new one too.
@@ -35,6 +42,7 @@ struct Config {
         if let v = o["silenceMs"] as? Int { c.silenceMs = v }
         if let v = o["maxSegmentSec"] as? Double { c.maxSegmentSec = v }
         if let v = o["speakerThreshold"] as? Double { c.speakerThreshold = Float(v) }
+        if let v = o["embeddingThreshold"] as? Double { c.embeddingThreshold = Float(v) }
         if let v = o["sessionGapMin"] as? Double { c.sessionGapMin = v }
         return c
     }

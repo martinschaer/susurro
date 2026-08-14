@@ -20,6 +20,7 @@ import Foundation
 final class SpeakerBook {
     private let diarizer = DiarizerManager()
     private let url: URL
+    private var lastSave = Date.distantPast
 
     /// wespeaker's window, and a hard cap rather than a preference: the extractor copies
     /// the whole input into a `[3, 160000]` batch buffer without clamping, so a longer
@@ -27,11 +28,8 @@ final class SpeakerBook {
     /// trimming loses nothing a longer clip would have contributed anyway.
     private static let window = 160_000        // 10 s @ 16 kHz
 
-    /// FluidAudio names a new speaker `Speaker <id>`. Anything else is a name a human
-    /// typed into speakers.json, and wins.
-    private static let unnamed = "Speaker "
-
-    init?(models dir: URL, threshold: Float, url: URL = SpeakerBook.defaultURL) {
+    init?(models dir: URL, threshold: Float, drift: Float = 0.25,
+          url: URL = SpeakerBook.defaultURL) {
         // The segmentation model is loaded but never run: `extractSpeakerEmbedding` reads
         // the frame count (589) off its output shape to size the mask. Hardcoding that
         // number would save 6 MB and break silently the day the model changes.
@@ -44,7 +42,13 @@ final class SpeakerBook {
         // FluidAudio derives its thresholds from a clustering config this path never uses.
         // Ours comes from config.json: the right cutoff depends on the room and on what
         // the conferencing codec did to the voice, exactly like the RMS gate.
-        diarizer.speakerManager = SpeakerManager(speakerThreshold: threshold)
+        //
+        // `drift` is the one that keeps a gallery honest. Every match under it EMA-blends
+        // the segment into the stored voiceprint, so leaving it at FluidAudio's 0.45 lets
+        // the centroid wander toward whoever is talking now — it ends up the mean voice in
+        // the room, within `threshold` of everybody, and no second speaker is ever minted.
+        diarizer.speakerManager = SpeakerManager(
+            speakerThreshold: threshold, embeddingThreshold: drift)
 
         self.url = url
         load()
@@ -70,33 +74,85 @@ final class SpeakerBook {
             embedding, speechDuration: Float(samples.count) / 16000)
         else { return nil }
 
-        // Centroids drift a little on every match and that loss is cheap; a brand new
-        // speaker is not, so that is the one moment worth paying a disk write for.
-        if diarizer.speakerManager.speakerCount != before { save() }
+        // A brand new speaker is worth a disk write on the spot. The drifted centroids
+        // are not, but a file that never moves for hours reads as a broken feature — so
+        // they go out on a minute's timer.
+        if diarizer.speakerManager.speakerCount != before
+            || Date().timeIntervalSince(lastSave) > 60 { save() }
 
-        let name = speaker.name.hasPrefix(Self.unnamed) ? "user-\(speaker.id)" : speaker.name
-        return (name, dist)
+        return (speaker.label, dist)
     }
 
     // MARK: - gallery
 
-    /// This file is a voiceprint database of people who agreed to be in a meeting, not to
-    /// this. Same 0700 as the transcripts, and deleting it forgets everyone.
     private func save() {
-        guard let data = try? JSONEncoder().encode(diarizer.speakerManager.getSpeakerList())
-        else { return }
-        try? data.write(to: url, options: .atomic)   // a rename, so permissions come after
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: url.path)
+        // A name is the one field a human edits behind our back: the naming window writes
+        // straight to the file, so it works with Listening off. Adopt those names before
+        // overwriting, or flushing the drifted centroids reverts the rename.
+        //
+        // ponytail: adopted at save time, so a rename reaches the live labels at the next
+        // flush rather than immediately. Push it through Transcriber's queue if that grates.
+        for edited in SpeakerNames.load(from: url) where edited.isNamed {
+            guard var mine = diarizer.speakerManager.getSpeaker(for: edited.id),
+                  mine.name != edited.name else { continue }
+            mine.name = edited.name
+            diarizer.speakerManager.upsertSpeaker(mine)
+        }
+        SpeakerNames.write(diarizer.speakerManager.getSpeakerList(), to: url)
+        lastSave = Date()
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: url),
-              let speakers = try? JSONDecoder().decode([Speaker].self, from: data)
-        else { return }
-        diarizer.speakerManager.initializeKnownSpeakers(speakers, mode: .reset)
+        let known = SpeakerNames.load(from: url)
+        guard !known.isEmpty else { return }
+        diarizer.speakerManager.initializeKnownSpeakers(known, mode: .reset)
     }
 
     /// Flush the drifted centroids. Called once, from `Transcriber.close`.
     func close() { save() }
+}
+
+// MARK: - naming
+
+/// The gallery as a plain file, with no models attached: the naming window has to work
+/// while Listening is off, and loading wespeaker just to rename someone would cost 6 MB
+/// and, on a cold start, half a minute.
+enum SpeakerNames {
+    static func load(from url: URL = SpeakerBook.defaultURL) -> [Speaker] {
+        guard let data = try? Data(contentsOf: url),
+              let list = try? JSONDecoder().decode([Speaker].self, from: data)
+        else { return [] }
+        return list.sorted { $0.createdAt < $1.createdAt }   // enrolment order, like user-N
+    }
+
+    /// Write `names` (id → name) over whatever is on disk *now*, ignoring blanks. Re-reading
+    /// instead of encoding the window's own copy: a running engine may have enrolled someone
+    /// since the window opened, and that embedding must survive somebody else's rename.
+    static func save(_ names: [String: String], to url: URL = SpeakerBook.defaultURL) {
+        var list = load(from: url)
+        for i in list.indices {
+            guard let typed = names[list[i].id]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !typed.isEmpty
+            else { continue }
+            list[i].name = typed
+        }
+        write(list, to: url)
+    }
+
+    /// This file is a voiceprint database of people who agreed to be in a meeting, not to
+    /// this. Same 0700 as the transcripts, and deleting it forgets everyone.
+    static func write(_ list: [Speaker], to url: URL) {
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        try? data.write(to: url, options: .atomic)   // a rename, so permissions come after
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+extension Speaker {
+    /// FluidAudio names a new speaker `Speaker <id>`. Anything else a human typed, and wins.
+    var isNamed: Bool { !name.hasPrefix("Speaker ") }
+
+    /// What the transcript calls this voice.
+    var label: String { isNamed ? name : "user-\(id)" }
 }

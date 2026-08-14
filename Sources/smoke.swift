@@ -1,5 +1,6 @@
 // Run with `make smoke`. Built like the app (-parse-as-library) but with its own @main,
 // linking Capture.swift + Transcriber.swift instead of SusurroApp.swift.
+import FluidAudio
 import Foundation
 
 private func check(_ ok: Bool, _ what: String) {
@@ -126,6 +127,53 @@ enum Smoke {
             for (i, v) in pcm.enumerated() where i % 6 != 0 { pitched.append(v) }
             check(reopened.label(pitched)?.name == "user-2",
                   "a different voice becomes a different speaker")
+
+            // MARK: drift — does `drift` actually reach the clustering
+            //
+            // Every match under `drift` EMA-blends the segment into the stored voiceprint.
+            // Left at FluidAudio's 0.45 the centroid walks toward whoever spoke last until
+            // it is the average voice in the room and matches everybody — which is how the
+            // real gallery ended up with two entries for months. That collapse needs
+            // hundreds of genuinely different voices to reproduce, so what is checked here
+            // is the knob itself: at 0 no match may touch the voiceprint, at 1 every match
+            // must. Get the parameter wrong and one of the two fails.
+            func moveAfterMatch(drift: Float, _ name: String) -> [Float] {
+                let url = out.appendingPathComponent("drift-\(name).json")
+                guard let a = SpeakerBook(models: models, threshold: 0.65, drift: drift, url: url)
+                else { print("  FAIL  could not open \(name) gallery"); exit(1) }
+                _ = a.label(pcm)                     // enrols user-1
+                a.close()
+                let enrolled = SpeakerNames.load(from: url)[0].currentEmbedding
+                guard let b = SpeakerBook(models: models, threshold: 0.65, drift: drift, url: url)
+                else { print("  FAIL  could not reopen \(name) gallery"); exit(1) }
+                _ = b.label(tail)                    // a confident match of the same voice
+                b.close()
+                let after = SpeakerNames.load(from: url)[0].currentEmbedding
+                check(enrolled.count == 256 && after.count == 256, "\(name) voiceprint is 256-d")
+                return zip(enrolled, after).map { $1 - $0 }
+            }
+            check(moveAfterMatch(drift: 0, "frozen").allSatisfy { $0 == 0 },
+                  "drift 0: a match leaves the stored voiceprint untouched")
+            check(moveAfterMatch(drift: 1, "loose").contains { $0 != 0 },
+                  "drift 1: a match does move it — the knob is wired to the clustering")
+
+            // MARK: naming — what the window does, minus the window
+            SpeakerNames.save(["1": "Ana", "2": "  "], to: gallery)
+            let renamed = SpeakerNames.load(from: gallery)
+            check(renamed.first { $0.id == "1" }?.name == "Ana", "rename by id landed")
+            check(renamed.first { $0.id == "2" }?.isNamed == false, "a blank field renames nobody")
+            check(renamed.allSatisfy { $0.currentEmbedding.count == 256 },
+                  "renaming kept every voiceprint")
+
+            guard let named = SpeakerBook(models: models, threshold: 0.65, url: gallery)
+            else { print("  FAIL  could not reopen renamed gallery"); exit(1) }
+            check(named.label(tail)?.name == "Ana", "the typed name is what the transcript records")
+
+            // Renamed behind a live book's back, then flushed: the rename has to win.
+            SpeakerNames.save(["2": "Bruno"], to: gallery)
+            named.close()
+            check(SpeakerNames.load(from: gallery).first { $0.id == "2" }?.name == "Bruno",
+                  "a flush of drifted centroids does not revert a rename")
         }
 
         // A gap longer than `gapSec` starts a new file. gapSec: 0 makes any elapsed time

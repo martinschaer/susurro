@@ -8,11 +8,11 @@ posts.
 original reasoning and the reversal are both kept below, since the *reason* B was
 recommended was a toolchain accident, not a technical judgement about the libraries.
 
-> **Status: steps 0 and 1 are implemented** on option C — see SPEC.md § Speakers.
+> **Status: steps 0, 1 and 2 are implemented** on option C — see SPEC.md § Speakers.
 > `speaker` and `dist` are in the JSONL, the gallery lives at `~/.susurro/speakers.json`,
-> and `make smoke` covers minting, matching, reload, and discrimination. Steps 2 (naming)
-> and 3 (splitting a segment) are not built; step 2 is already usable by hand-editing
-> `name` in `speakers.json`.
+> naming is the *Name speakers…* window (or hand-editing `name`, same file), and
+> `make smoke` covers minting, matching, reload, discrimination, and renaming. Step 3
+> (splitting a segment) is not built.
 
 ## The short version
 
@@ -383,7 +383,10 @@ that's rare, never build it.
   why". The why: model loading plus a persisted gallery is a distinct lifecycle from the
   whisper context, and inlining it would blur the one thing `Transcriber.swift` currently does
   well.
-- `Config` (`Sources/Capture.swift:12`) — one `speakerThreshold` field, same pattern as the rest.
+- `Config` (`Sources/Capture.swift:12`) — a `speakerThreshold` and an `embeddingThreshold`
+  field, same pattern as the rest. The second one is not optional flexibility: FluidAudio's
+  0.45 default lets the centroid follow the room, which collapses a long-lived gallery into
+  one entry. See SPEC.md § Calibration.
 - SPEC.md — "diarization beyond mic-vs-system" currently sits under **Out**; the toolchain
   section's "SwiftPM is broken" is now conditional on which `swiftc` you're holding. Both need
   a rewrite.

@@ -1,9 +1,11 @@
 import AppKit
+import FluidAudio
 import SwiftUI
 
 @main
 struct SusurroApp: App {
     @State private var engine = Engine()
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         MenuBarExtra {
@@ -25,6 +27,10 @@ struct SusurroApp: App {
             Button("Open transcripts…") {
                 NSWorkspace.shared.activateFileViewerSelecting([Transcriber.defaultDir])
             }
+            Button("Name speakers…") {
+                NSApp.activate(ignoringOtherApps: true)   // an LSUIElement app is never frontmost
+                openWindow(id: "speakers")
+            }
 
             Divider()
             Button("Quit Susurro") {
@@ -35,6 +41,43 @@ struct SusurroApp: App {
         } label: {
             Image(systemName: engine.listening ? "waveform" : "waveform.slash")
         }
+
+        Window("Speaker names", id: "speakers") { SpeakerNamesView() }
+            .windowResizability(.contentSize)
+    }
+}
+
+/// Put a name on a voice. `user-3` in the transcripts is a FluidAudio id and only a human
+/// knows it is Ana; from the rename on, every later line says Ana. Older lines keep the id
+/// — the transcripts are append-only.
+struct SpeakerNamesView: View {
+    @State private var speakers: [Speaker] = []
+    @State private var names: [String: String] = [:]      // id → what is in the field
+
+    var body: some View {
+        Form {
+            if speakers.isEmpty {
+                Text("No voices yet. The system stream enrols one the first time somebody "
+                     + "who is not you speaks.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(speakers) { s in
+                TextField("user-\(s.id)", text: Binding(
+                    get: { names[s.id] ?? "" },
+                    set: { names[s.id] = $0 }), prompt: Text("unnamed"))
+            }
+            Button("Save") { SpeakerNames.save(names); reload() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(speakers.isEmpty)
+        }
+        .formStyle(.grouped)
+        .frame(width: 320)
+        .onAppear(perform: reload)         // the gallery grows while the window is closed
+    }
+
+    private func reload() {
+        speakers = SpeakerNames.load()
+        names = speakers.reduce(into: [:]) { $0[$1.id] = $1.isNamed ? $1.name : "" }
     }
 }
 
@@ -83,7 +126,8 @@ final class Engine {
         DispatchQueue.global(qos: .userInitiated).async {
             // Missing speaker models must not cost you the transcript: without them every
             // system line is simply labelled "unknown".
-            let book = SpeakerBook(models: models, threshold: cfg.speakerThreshold)
+            let book = SpeakerBook(models: models, threshold: cfg.speakerThreshold,
+                                   drift: cfg.embeddingThreshold)
             let t = Transcriber(model: model, vad: vadURL, speakers: book,
                                 gapSec: cfg.sessionGapMin * 60)
             DispatchQueue.main.async {
