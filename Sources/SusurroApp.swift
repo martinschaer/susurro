@@ -50,34 +50,168 @@ struct SusurroApp: App {
 /// Put a name on a voice. `user-3` in the transcripts is a FluidAudio id and only a human
 /// knows it is Ana; from the rename on, every later line says Ana. Older lines keep the id
 /// — the transcripts are append-only.
+///
+/// One reference type, read by both views, is what keeps a rename visible. Handing the
+/// detail view a `Speaker` and a refresh callback instead left it holding a value copy from
+/// before the rename: the roster kept saying `unnamed` and the field re-seeded itself blank
+/// off the stale copy. Views now carry the id — immutable — and look the voice up.
+@Observable
+final class Gallery {
+    private(set) var speakers: [Speaker] = []
+
+    /// The gallery grows while the window is closed, so this is called on every appearance.
+    func reload() { speakers = SpeakerNames.load() }
+
+    func speaker(_ id: String) -> Speaker? { speakers.first { $0.id == id } }
+
+    func rename(_ id: String, to name: String) {
+        SpeakerNames.save([id: name])     // read-modify-write; a blank renames nobody
+        reload()
+    }
+}
+
+/// The roster: every voice, read-only. A row is a `user-N` and nothing else identifying, so
+/// the naming happens one voice at a time in `SpeakerDetailView`, next to what it said.
 struct SpeakerNamesView: View {
-    @State private var speakers: [Speaker] = []
-    @State private var names: [String: String] = [:]      // id → what is in the field
+    @State private var gallery = Gallery()
 
     var body: some View {
-        Form {
-            if speakers.isEmpty {
-                Text("No voices yet. The system stream enrols one the first time somebody "
-                     + "who is not you speaks.")
-                    .foregroundStyle(.secondary)
+        NavigationStack {
+            List {
+                if gallery.speakers.isEmpty {
+                    Text("No voices yet. The system stream enrols one the first time "
+                         + "somebody who is not you speaks.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(gallery.speakers) { s in
+                    NavigationLink(value: s.id) {
+                        HStack {
+                            Text("user-\(s.id)")
+                            Spacer()
+                            Text(s.isNamed ? s.name : "unnamed")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
-            ForEach(speakers) { s in
-                TextField("user-\(s.id)", text: Binding(
-                    get: { names[s.id] ?? "" },
-                    set: { names[s.id] = $0 }), prompt: Text("unnamed"))
+            .navigationDestination(for: String.self) { id in
+                SpeakerDetailView(id: id, gallery: gallery)
             }
-            Button("Save") { SpeakerNames.save(names); reload() }
-                .keyboardShortcut(.defaultAction)
-                .disabled(speakers.isEmpty)
         }
-        .formStyle(.grouped)
-        .frame(width: 320)
-        .onAppear(perform: reload)         // the gallery grows while the window is closed
+        .frame(width: 420, height: 460)      // fixed, so pushing a view does not resize
+        .onAppear(perform: gallery.reload)
+    }
+}
+
+/// One voice, with enough of what it said to recognise it.
+private struct SpeakerDetailView: View {
+    let id: String
+    let gallery: Gallery
+
+    @State private var typed = ""
+    @State private var snippets: [TranscriptSnippets.Snippet] = []
+    @State private var expanded: Set<Int> = []
+
+    private var speaker: Speaker? { gallery.speaker(id) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TextField("user-\(id)", text: $typed, prompt: Text("unnamed"))
+                Button("Save") { gallery.rename(id, to: typed) }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            HStack {
+                Text("What this voice said").font(.headline)
+                Spacer()
+                Button("Another 10") { shuffle() }
+            }
+
+            if snippets.isEmpty {
+                Text("No transcript lines for this voice yet.")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                // By index: a snippet is a line of text, and the same sentence can honestly
+                // turn up twice in one sample.
+                List(snippets.indices, id: \.self) { i in
+                    // A Button, not an onTapGesture, so a row stays keyboard-reachable.
+                    Button { toggle(i) } label: { row(i) }
+                        .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding()
+        .navigationTitle(speaker.map { $0.isNamed ? $0.name : "user-\(id)" } ?? "user-\(id)")
+        .onAppear {
+            typed = speaker.flatMap { $0.isNamed ? $0.name : nil } ?? ""
+            shuffle()
+        }
     }
 
-    private func reload() {
-        speakers = SpeakerNames.load()
-        names = speakers.reduce(into: [:]) { $0[$1.id] = $1.isNamed ? $1.name : "" }
+    /// One sampled line, collapsed to three lines of text; expanded, the turn either side
+    /// of it as well — chronological, so the exchange reads top to bottom.
+    private func row(_ i: Int) -> some View {
+        let s = snippets[i]
+        let open = expanded.contains(i)
+        return VStack(alignment: .leading, spacing: 3) {
+            if open, let before = s.before { turn(before) }
+
+            HStack(alignment: .top, spacing: 6) {
+                if open {
+                    speakerTag(s.line.speaker)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: tagWidth, alignment: .trailing)
+                }
+                Text(s.line.text)
+                    .lineLimit(open ? nil : 3)   // expanded shows the complete message
+                Spacer(minLength: 0)
+            }
+
+            if open, let after = s.after { turn(after) }
+
+            Text(s.ts.prefix(16).replacingOccurrences(of: "T", with: " "))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, tagWidth + 6)
+        }
+        .contentShape(Rectangle())   // the gaps are part of the click target
+    }
+
+    /// A neighbouring turn: whose it was is the whole point — `me` either side means this
+    /// voice was answering you.
+    private func turn(_ t: TranscriptSnippets.Turn) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            speakerTag(t.speaker)
+            Text(t.text)
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    /// Fixed width, trailing-aligned, so the three turns line up as a column.
+    private func speakerTag(_ who: String) -> some View {
+        Text(who)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(width: tagWidth, alignment: .trailing)
+    }
+
+    private var tagWidth: CGFloat { 54 }
+
+    private func toggle(_ i: Int) {
+        if expanded.contains(i) { expanded.remove(i) } else { expanded.insert(i) }
+    }
+
+    private func shuffle() {
+        expanded = []                // indices would otherwise point at the previous sample
+        snippets = speaker.map { TranscriptSnippets.random(for: $0) } ?? []
     }
 }
 
