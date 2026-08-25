@@ -156,3 +156,64 @@ extension Speaker {
     /// What the transcript calls this voice.
     var label: String { isNamed ? name : "user-\(id)" }
 }
+
+// MARK: - snippets
+
+/// What a voice actually said, so a human can work out whose it is. A `user-N` on its own
+/// is unnamable: nobody remembers which FluidAudio id was Ana, but everybody recognises
+/// what she said. Read straight off the JSONL for the same reason `SpeakerNames` is — the
+/// naming window must work with Listening off and no models loaded.
+enum TranscriptSnippets {
+    private struct Line: Decodable { let ts, speaker, text: String }
+
+    /// One line of transcript and who said it — `me`, a `user-N` or a name.
+    struct Turn: Equatable { let speaker: String, text: String }
+
+    /// A sampled line with the turns either side of it, so the exchange can be read rather
+    /// than the line alone. "Yeah, that works for me" identifies nobody; the same line
+    /// between two of yours does.
+    struct Snippet { let ts: String; let before: Turn?; let line: Turn; let after: Turn? }
+
+    /// Up to `count` lines this speaker spoke, sampled at random across every transcript.
+    ///
+    /// `Transcriber` records `Speaker.label` at write time, so lines from before a rename
+    /// say `user-N` and lines from after say the name — both belong to this voice. A voice
+    /// renamed twice loses its middle-era lines; see SPEC.md § Known limitations.
+    ///
+    /// ponytail: re-reads every file on every call, no index. A few MB of JSONL is nothing
+    /// next to the window it feeds — index it the day that stops being true.
+    static func random(for speaker: Speaker, count: Int = 10,
+                       dir: URL = Transcriber.defaultDir) -> [Snippet] {
+        var wanted: Set<String> = ["user-\(speaker.id)"]
+        if speaker.isNamed { wanted.insert(speaker.name) }
+
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil)) ?? []
+        let decoder = JSONDecoder()
+        var hits: [Snippet] = []
+        for file in files where file.pathExtension == "jsonl" {
+            guard let body = try? String(contentsOf: file, encoding: .utf8) else { continue }
+
+            // `map`, not `compactMap`: the array has to stay the same length as the file or
+            // index ±1 is not the adjacent line any more, and every snippet after a dropped
+            // line would quote the wrong person. An undecodable line — the half-written
+            // tail of a file the engine is appending to — is context nobody gets instead.
+            let lines = body.split(separator: "\n").map {
+                try? decoder.decode(Line.self, from: Data($0.utf8))
+            }
+            for (i, line) in lines.enumerated() {
+                guard let line, wanted.contains(line.speaker) else { continue }
+                // Neighbours come from this file only, which is to say this meeting only.
+                hits.append(Snippet(ts: line.ts, before: turn(lines, i - 1),
+                                    line: Turn(speaker: line.speaker, text: line.text),
+                                    after: turn(lines, i + 1)))
+            }
+        }
+        return Array(hits.shuffled().prefix(count))
+    }
+
+    private static func turn(_ lines: [Line?], _ i: Int) -> Turn? {
+        guard lines.indices.contains(i), let l = lines[i] else { return nil }
+        return Turn(speaker: l.speaker, text: l.text)
+    }
+}

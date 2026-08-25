@@ -35,11 +35,79 @@ enum Smoke {
         quietSeg.push(quiet(3.0))
         check(none.isEmpty, "silence produces no segments")
 
+        // MARK: snippets — what the naming window shows, minus the window
+        //
+        // No models needed, so this runs even on a bare checkout. Its own directory: the
+        // gap check at the bottom counts files in `out`.
+        let snips = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("susurro-snips-\(getpid())")
+        try FileManager.default.createDirectory(at: snips, withIntermediateDirectories: true)
+        // An exchange, because the context either side is the point. Last line truncated,
+        // as a file the engine is still appending to would be.
+        try """
+        {"ts":"2026-01-01T09:00:00+01:00","source":"mic","speaker":"me","text":"so what do you think"}
+        {"ts":"2026-01-01T09:01:00+01:00","source":"system","speaker":"user-1","text":"before the rename"}
+        {"ts":"2026-01-01T09:02:00+01:00","source":"system","speaker":"Ana","text":"after the rename"}
+        {"ts":"2026-01-01T09:03:00+01:00","source":"system","speaker":"user-2","text":"somebody else"}
+        not json at all
+        {"ts":"2026-01-01T09:05:00+01:00","source":"system","speaker":"user-1","text":"after the gap"}
+        {"ts":"2026-01-01T09:06:00+01:00","source":"system","speaker":"user-1","tex
+        """.write(to: snips.appendingPathComponent("a.jsonl"), atomically: true, encoding: .utf8)
+        // A second meeting, one line long: a neighbour must never cross a file.
+        try """
+        {"ts":"2026-01-02T09:00:00+01:00","source":"system","speaker":"user-1","text":"alone in its file"}
+        """.write(to: snips.appendingPathComponent("b.jsonl"), atomically: true, encoding: .utf8)
+
+        // FluidAudio's default name for id 1, i.e. nobody has renamed this voice yet.
+        let anon = Speaker(id: "1", name: "Speaker 1", currentEmbedding: [1, 0, 0])
+        let anonSnips = TranscriptSnippets.random(for: anon, dir: snips)
+        check(Set(anonSnips.map(\.line.text))
+                == ["before the rename", "after the gap", "alone in its file"],
+              "an unnamed voice matches its user-N lines, across files "
+              + "(got \(anonSnips.map(\.line.text)))")
+
+        // Renamed: the pre-rename lines still say user-1 and must not be lost.
+        let ana = Speaker(id: "1", name: "Ana", currentEmbedding: [1, 0, 0])
+        let anaSnips = TranscriptSnippets.random(for: ana, dir: snips)
+        check(Set(anaSnips.map(\.line.text)) == ["before the rename", "after the rename",
+                                                 "after the gap", "alone in its file"],
+              "a renamed voice matches both its name and its user-N lines")
+        check(TranscriptSnippets.random(for: ana, count: 1, dir: snips).count == 1,
+              "count caps the sample")
+
+        // MARK: snippet context — the turn either side, which is what identifies a voice
+        guard let mid = anonSnips.first(where: { $0.line.text == "before the rename" }) else {
+            print("  FAIL  sampled line missing"); exit(1)
+        }
+        check(mid.before?.speaker == "me" && mid.before?.text == "so what do you think",
+              "the previous turn comes back with whose it was (got \(mid.before as Any))")
+        check(mid.after?.text == "after the rename",
+              "the next turn comes back too (got \(mid.after as Any))")
+
+        // First and last line of its file: no context, and the truncated tail of the *other*
+        // file must not leak in as a neighbour.
+        guard let lone = anonSnips.first(where: { $0.line.text == "alone in its file" }) else {
+            print("  FAIL  second file not scanned"); exit(1)
+        }
+        check(lone.before == nil && lone.after == nil,
+              "a file-boundary line has no neighbours rather than the wrong ones")
+
+        // An undecodable line mid-file must not shift the lines after it. `compactMap`
+        // instead of `map` would drop it, close the gap, and quote "somebody else" — the
+        // wrong person — as what came before this one. Both sides are unreadable here.
+        guard let gapped = anonSnips.first(where: { $0.line.text == "after the gap" }) else {
+            print("  FAIL  line after an unreadable one not sampled"); exit(1)
+        }
+        check(gapped.before == nil && gapped.after == nil,
+              "an unreadable neighbour is no context, not the next one along "
+              + "(got \(gapped.before as Any) / \(gapped.after as Any))")
+        try? FileManager.default.removeItem(at: snips)
+
         // MARK: Transcriber — jfk.wav all the way to JSONL on disk
         let model = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models/ggml-tiny.bin")
         guard FileManager.default.fileExists(atPath: model.path) else {
             print("  SKIP  transcriber (no ggml-tiny.bin — run ./setup.sh)")
-            print("segmenter checks passed")
+            print("segmenter + snippet checks passed")
             return
         }
 

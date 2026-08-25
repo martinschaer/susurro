@@ -239,7 +239,7 @@ created on first write, so a session where nobody spoke leaves nothing behind.
 [✓] Listening          ⌘L      → toggles capture
     ─────────────────
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
-    Name speakers…             → one Window scene, one text field per voice
+    Name speakers…             → one Window scene: roster, then one voice at a time
     ─────────────────
     Quit Susurro       ⌘Q
 ```
@@ -307,14 +307,23 @@ files; too high and two back-to-back meetings become one.
 
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
 
-Naming is not: *Name speakers…* lists the gallery, one text field per voice labelled with
-the `user-N` the transcripts use, and every later line says `Ana`. Hand-editing `name` in
-`~/.susurro/speakers.json` still works and is the same operation — the window is only a
-read-modify-write of that file, which is why it needs no models loaded and works with
-Listening off. `SpeakerBook` re-reads the names before it writes, so a rename survives the
+Naming is not: *Name speakers…* lists the gallery read-only — a `user-N` and either its
+name or `unnamed` — because a bare id is unnamable; nobody remembers which id was Ana.
+Clicking a row opens that one voice: a name field, and 10 lines sampled at random from the
+transcripts where it appears, with a button for another 10. Clicking a line expands it to
+the turn either side, labelled with who said it — `me` on both sides means this voice was
+answering you, which places it faster than the line alone does. Neighbours come from the
+same file, so never across meetings; segments are cut on silence, so "the line before" is
+sometimes the same person's previous segment rather than somebody else's turn. That is the
+identification — you recognise what somebody said, and who they said it to. From the rename on, every later line says `Ana`. Lines
+already written keep the old label, so the sample matches both `user-N` and the current
+name. Hand-editing `name` in `~/.susurro/speakers.json` still works and is the same
+operation — the window is only a read-modify-write of that file, which is why it needs no
+models loaded and works with Listening off. Reading the snippets is the same trick applied
+to the transcripts: a directory scan and a JSONL decode, no whisper context. `SpeakerBook` re-reads the names before it writes, so a rename survives the
 running session flushing its drifted centroids; it reaches the live labels at that flush,
-not the instant you click Save. Lines already written keep the old label — the transcripts
-are append-only.
+not the instant you click Save. The transcripts are append-only; nothing rewrites a label
+that is already on disk.
 
 ## Known limitations
 
@@ -345,7 +354,11 @@ Accepted for a prototype, listed so they are not rediscovered as bugs:
    and to start false-merging as strangers accumulate, since each false merge poisons a
    centroid and causes the next. `dist` in the JSONL is there so a bad stretch can be
    re-clustered offline.
-9. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
+9. **A voice renamed twice loses its middle-era snippets.** The transcripts record the
+   label as it was at write time, and only the current name plus `user-N` are searched, so
+   the lines written under a discarded name are not sampled. Renaming once — the normal
+   case — is unaffected.
+10. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
    not to this. It lives at `0700`/`0600` beside the transcripts, and deleting the file
    forgets everyone.
 
@@ -361,6 +374,14 @@ The same audio also goes down the `system` stream twice, asserting `me` / `user-
 reopen, and that a decimated (~1.2× pitch) copy becomes `user-2`. That last one is the
 only check that catches an embedder returning a constant vector, which would collapse
 everyone into `user-1` while every other assertion still passed.
+
+The snippet checks need no models at all. Two hand-written JSONL fixtures assert that an
+unnamed voice matches only its `user-N` lines and a renamed one both its name and its
+`user-N` lines, that both files are scanned, and that context is the genuinely adjacent
+line: a match at a file boundary reports no neighbour, and one next to an undecodable line
+reports no neighbour rather than the next readable line along. That last one is the whole
+reason the decode keeps `[Line?]` instead of compacting — with `compactMap` it fails,
+quoting the wrong speaker.
 
 Both targets build with `-parse-as-library` and carry their own `@main`; `smoke.swift`
 links `Capture.swift` + `Transcriber.swift` instead of `SusurroApp.swift`. Top-level code
