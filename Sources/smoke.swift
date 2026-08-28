@@ -225,6 +225,26 @@ enum Smoke {
             check(moveAfterMatch(drift: 1, "loose").contains { $0 != 0 },
                   "drift 1: a match does move it — the knob is wired to the clustering")
 
+            // MARK: the walk — `drift` caps one hop, nothing caps their sum
+            //
+            // Same voice over and over, with drift wide open: without the freeze the
+            // centroid keeps moving forever, which is how one entry ends up within
+            // `threshold` of everybody. Feeding it *one* voice understates the real
+            // damage (the room's other voices are what it walks toward) and is still
+            // enough to catch a freeze that stopped working.
+            let walk = out.appendingPathComponent("walk.json")
+            var prints: [[Float]] = []
+            for _ in 0..<25 {
+                guard let w = SpeakerBook(models: models, threshold: 0.65, drift: 1, url: walk)
+                else { print("  FAIL  could not open walk gallery"); exit(1) }
+                _ = w.label(pcm)
+                w.close()
+                prints.append(SpeakerNames.load(from: walk)[0].currentEmbedding)
+            }
+            let moved = zip(prints[prints.count - 2], prints[prints.count - 1])
+                .contains { $0 != $1 }
+            check(!moved, "a settled voiceprint stops moving (25 matches, drift wide open)")
+
             // MARK: naming — what the window does, minus the window
             SpeakerNames.save(["1": "Ana", "2": "  "], to: gallery)
             let renamed = SpeakerNames.load(from: gallery)

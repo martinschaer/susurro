@@ -17,7 +17,13 @@ struct Config {
     /// codec-dependent like `rmsThreshold`. FluidAudio suggests 0.6–0.8, tuned for one
     /// recording; a gallery that lives for weeks needs tighter, or every voice ends up in
     /// the first entry. Raise it if one person keeps splitting into two `user-N`.
-    var speakerThreshold: Float = 0.45
+    ///
+    /// 0.35 is measured, not guessed. Scoring this machine's own gallery — same-speaker
+    /// pairs against different-speaker pairs — puts same-speaker at p95 0.33 and
+    /// different-speaker at p05 0.41, so the two distributions have a gap and 0.35 sits
+    /// in it. The old 0.45 sat inside the different-speaker distribution: ~10% of pairs
+    /// from two different people fell under it, which is exactly the reported symptom.
+    var speakerThreshold: Float = 0.35
 
     /// Max distance for a match to also drag the stored voiceprint toward it. Below
     /// FluidAudio's 0.45 default on purpose: measured p50 distance on real calls is 0.23,

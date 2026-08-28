@@ -21,12 +21,20 @@ final class SpeakerBook {
     private let diarizer = DiarizerManager()
     private let url: URL
     private var lastSave = Date.distantPast
+    private let drift: Float
 
     /// wespeaker's window, and a hard cap rather than a preference: the extractor copies
     /// the whole input into a `[3, 160000]` batch buffer without clamping, so a longer
     /// clip writes over the neighbouring batch slots. Only slot 0 is read back, so
     /// trimming loses nothing a longer clip would have contributed anyway.
     private static let window = 160_000        // 10 s @ 16 kHz
+
+    /// EMA updates a voiceprint is allowed before it is frozen. `drift` bounds one hop;
+    /// nothing bounds the sum, and the hops compound in one direction. Measured on this
+    /// machine's gallery: 50 hops walked a centroid 0.23 from where it started, which is
+    /// most of the way to a different person. At alpha 0.9 the mean is 88% converged
+    /// after 20 hops, so the ones after that buy accuracy no longer available to buy.
+    private static let settled = 20
 
     init?(models dir: URL, threshold: Float, drift: Float = 0.25,
           url: URL = SpeakerBook.defaultURL) {
@@ -50,6 +58,7 @@ final class SpeakerBook {
         diarizer.speakerManager = SpeakerManager(
             speakerThreshold: threshold, embeddingThreshold: drift)
 
+        self.drift = drift
         self.url = url
         load()
     }
@@ -68,7 +77,18 @@ final class SpeakerBook {
         let clip = samples.count > Self.window ? Array(samples[0..<Self.window]) : samples
         guard let embedding = try? diarizer.extractSpeakerEmbedding(from: clip) else { return nil }
 
-        let dist = diarizer.speakerManager.findSpeaker(with: embedding).distance
+        let match = diarizer.speakerManager.findSpeaker(with: embedding)
+
+        // Freeze the voiceprint once it is built from enough speech, by denying this one
+        // assignment the right to move it. A centroid that keeps chasing the room becomes
+        // the average voice in it and then matches everybody — the failure `drift` was
+        // meant to stop, and only slows, because it caps each hop and not the walk.
+        let updates = match.id.flatMap {
+            diarizer.speakerManager.getSpeaker(for: $0)?.updateCount
+        } ?? 0
+        diarizer.speakerManager.embeddingThreshold = updates >= Self.settled ? 0 : drift
+
+        let dist = match.distance
         let before = diarizer.speakerManager.speakerCount
         guard let speaker = diarizer.speakerManager.assignSpeaker(
             embedding, speechDuration: Float(samples.count) / 16000)
