@@ -172,9 +172,10 @@ all-ones frame mask to WeSpeaker and returning a 256-d L2-normalized vector.
 refines the matched centroid by EMA. Defaults worth knowing:
 
 ```
-speakerThreshold           = 0.45      // config.json; <0.3 is a confident match
+speakerThreshold           = 0.35      // config.json; <0.3 is a confident match
 embeddingThreshold         = 0.25      // config.json; above this a match does not
                                        //   refine the centroid, only its duration
+settled                    = 20        // EMA updates, then the voiceprint is frozen
 minSpeechDuration          = 1.0 s     // below this: match, never enroll
 minEmbeddingUpdateDuration = 2.0 s     // below this: match, never update the centroid
 ```
@@ -192,6 +193,20 @@ meetings produced two entries whose own stored exemplars were further apart (p50
 than the two entries were from each other (0.423). Offline clustering of those same
 exemplars finds six to eleven voices. Keep the blend rare and the voiceprint stays the
 person who enrolled it.
+
+`embeddingThreshold` caps one hop, and nothing caps their sum — which is the rot it does
+*not* stop. The hops compound in one direction, so a voiceprint keeps sliding at 0.25 the
+way it sprinted at 0.45, just slower. Measured on a real gallery: 50 hops moved a centroid
+0.23 from where it started, and one entry's own exemplars ran from 0.09 to 0.43 of its
+first — a step, dated a week later, where a second person arrived and was absorbed. So a
+voiceprint is frozen after `settled` updates. At `alpha: 0.9` the mean is 88% converged by
+then; every hop after that is chasing the room, not learning the person.
+
+`speakerThreshold` was 0.45, and that was too loose. Scoring a real gallery — same-speaker
+exemplar pairs against different-speaker pairs — the two distributions separate cleanly,
+same-speaker at p95 0.33 and different-speaker at p05 0.41. 0.45 sits inside the
+different-speaker distribution: about 10% of pairs drawn from two different people fall
+under it, which is how strangers end up sharing a `user-N`. 0.35 sits in the gap.
 
 **Clips are hard-capped at 10 s** before they reach the extractor. That is not a
 preference: the extractor copies its input into a `[3, 160000]` batch buffer with no
@@ -288,7 +303,7 @@ Bluetooth headset have different noise floors, and no fixed constant is right fo
 three. Expose it as `~/.susurro/config.json`:
 
 ```json
-{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.45,
+{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.35,
  "embeddingThreshold": 0.25, "sessionGapMin": 5}
 ```
 
@@ -392,7 +407,10 @@ Manual acceptance: enable → say something → play a YouTube clip → confirm 
 has both a `mic` and a `system` line with sane text, the mic lines say `me`, and the clip's
 voices got `user-N`. Then join a call with two other people and check the two of them do
 not collapse into one `user-N` — if they do, lower `speakerThreshold`, and check
-`embeddingThreshold` is not letting the centroids wander.
+`embeddingThreshold` is not letting the centroids wander. A gallery already collapsed
+cannot be tuned back out of it: a centroid that has become the room's average voice stays
+within any usable threshold of everybody, so delete `~/.susurro/speakers.json` and let it
+re-enrol.
 
 That collapse is not reproducible in `smoke.swift`: it needs hundreds of genuinely
 different voices, and one `jfk.wav` pitch-shifted cannot fake them. The smoke check covers
