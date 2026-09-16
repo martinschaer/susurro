@@ -18,6 +18,14 @@ struct SusurroApp: App {
             if engine.loading {
                 Text("Loading model…").foregroundStyle(.secondary)
             }
+            if !engine.modelsReady {
+                Divider()
+                if let status = engine.downloading {
+                    Text(status).foregroundStyle(.secondary)
+                } else {
+                    Button("Download models (2.8 GB)…") { engine.downloadModels() }
+                }
+            }
             if let problem = engine.problem {
                 Divider()
                 Text(problem).foregroundStyle(.secondary)
@@ -224,6 +232,18 @@ final class Engine {
     private(set) var enabled = false          // intent — flips as soon as you click
     private(set) var loading = false          // model is being loaded off the main thread
     private(set) var problem: String?
+    private(set) var downloading: String?     // last line out of models.sh, nil when idle
+
+    /// Stored rather than computed: `@Observable` only tracks stored properties, and the
+    /// menu has to lose its Download item the moment the download finishes.
+    private(set) var modelsReady = Engine.checkModels()
+
+    static let modelsDir = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models")
+
+    static func checkModels() -> Bool {
+        FileManager.default.fileExists(
+            atPath: modelsDir.appendingPathComponent(Config.load().model).path)
+    }
 
     /// Actually capturing, as opposed to merely switched on and still loading.
     var listening: Bool { enabled && !loading }
@@ -232,18 +252,69 @@ final class Engine {
     private var mic: MicCapture?
     private var system: SystemCapture?
     private var generation = 0                // invalidates an in-flight load on toggle-off
+    private var download: Process?            // held so it outlives this call
 
     func setEnabled(_ on: Bool) { on ? start() : stop() }
+
+    /// Runs the `models.sh` bundled in Resources — the same script `setup.sh` calls, so
+    /// there is one fetch path and not two. It is idempotent and resumable, so a failed
+    /// run is fixed by clicking again.
+    ///
+    /// The script's stdout is one short line per file and goes straight in the menu;
+    /// curl's progress bar is on stderr and goes to a log, because \r-redrawing a
+    /// progress bar into a menu item is not a thing.
+    func downloadModels() {
+        guard download == nil,
+              let script = Bundle.main.path(forResource: "models", ofType: "sh")
+        else { return }
+
+        downloading = "starting…"
+        let log = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models-download.log")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script]
+        p.standardError = try? FileHandle(forWritingTo: log)
+
+        let out = Pipe()
+        p.standardOutput = out
+        out.fileHandleForReading.readabilityHandler = { h in
+            guard let text = String(data: h.availableData, encoding: .utf8),
+                  let line = text.split(separator: "\n").last(where: { !$0.isEmpty })
+            else { return }
+            DispatchQueue.main.async { self.downloading = String(line) }
+        }
+
+        p.terminationHandler = { proc in
+            out.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async {
+                self.download = nil
+                self.modelsReady = Engine.checkModels()
+                // Exit status alone is not enough: the script can succeed while the
+                // configured model is one it does not fetch.
+                self.downloading = self.modelsReady && proc.terminationStatus == 0
+                    ? nil : "download failed — see ~/.susurro/models-download.log"
+            }
+        }
+
+        do {
+            try p.run()
+            download = p
+        } catch {
+            downloading = "could not start: \(error.localizedDescription)"
+        }
+    }
 
     private func start() {
         guard !enabled else { return }
         problem = nil
 
         let cfg = Config.load()
-        let models = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models")
+        let models = Self.modelsDir
         let model = models.appendingPathComponent(cfg.model)
         guard FileManager.default.fileExists(atPath: model.path) else {
-            problem = "Missing model: \(cfg.model) — run ./setup.sh"
+            problem = "Missing model: \(cfg.model) — use Download models"
             return
         }
         let vad = models.appendingPathComponent("ggml-silero-v5.1.2.bin")
@@ -287,7 +358,7 @@ final class Engine {
 
                 // One source failing must not take the other down.
                 var failures: [String] = []
-                if book == nil { failures.append("speaker models missing — run ./setup.sh") }
+                if book == nil { failures.append("speaker models missing — use Download models") }
                 do { try m.start() } catch {
                     failures.append("mic: \(error.localizedDescription)")
                 }

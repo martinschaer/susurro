@@ -8,16 +8,6 @@ FA=vendor/fluidaudio
 FA_TAG=v0.15.5
 FA_REL="$FA/.build/arm64-apple-macosx/release"
 SWIFT="$HOME/.swiftly/bin/swift"
-M="$HOME/.susurro/models"
-HF=https://huggingface.co
-mkdir -p "$M" "$HOME/.susurro/transcripts"
-chmod 700 "$HOME/.susurro" "$HOME/.susurro/transcripts"
-
-fetch() {  # url dest
-  [ -s "$2" ] && { echo "have $(basename "$2")"; return; }
-  echo "fetching $(basename "$2")"
-  curl -fL --progress-bar -o "$2.part" "$1" && mv "$2.part" "$2"
-}
 
 # 1. whisper.cpp source
 if [ ! -d "$W" ]; then
@@ -64,30 +54,8 @@ if [ ! -f "$FA_REL/libFluidAudio.a" ]; then
     "$FA_REL"/MachTaskSelfWrapper.build/*.o
 fi
 
-# 4. models
-fetch "$HF/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin" "$M/ggml-tiny.bin"
-fetch "$HF/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" "$M/ggml-silero-v5.1.2.bin"
-fetch "$HF/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" "$M/ggml-large-v3-turbo.bin"
-
-# Core ML encoder must sit beside the .bin as <model>-encoder.mlmodelc — whisper.cpp
-# derives that path by string surgery and silently falls back to CPU if it is missing.
-if [ ! -d "$M/ggml-large-v3-turbo-encoder.mlmodelc" ]; then
-  fetch "$HF/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-encoder.mlmodelc.zip" \
-        "$M/turbo-encoder.zip"
-  echo "unzipping Core ML encoder"
-  unzip -q -o "$M/turbo-encoder.zip" -d "$M" && rm -rf "$M/turbo-encoder.zip" "$M/__MACOSX"
-fi
-
-# Speaker embedding models. FluidAudio would fetch these itself on first use, but an
-# always-on recorder must not block on the network mid-session, so pull them up front.
-# .mlmodelc is a directory, hence the inner loop.
-for m in pyannote_segmentation wespeaker_v2; do
-  mkdir -p "$M/$m.mlmodelc/analytics" "$M/$m.mlmodelc/weights"
-  for f in analytics/coremldata.bin coremldata.bin metadata.json model.mil weights/weight.bin; do
-    fetch "$HF/FluidInference/speaker-diarization-coreml/resolve/main/$m.mlmodelc/$f" \
-          "$M/$m.mlmodelc/$f"
-  done
-done
+# 4. models — the only part a distributed app also needs.
+./models.sh
 
 echo
 echo "done. next: make smoke && make run"

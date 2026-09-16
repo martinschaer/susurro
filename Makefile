@@ -20,13 +20,14 @@ LINK := -L$(B)/src -L$(B)/ggml/src -L$(B)/ggml/src/ggml-blas \
         $(FAR)/libFluidAudio.a \
         -framework Accelerate -framework CoreML -lc++
 
-.PHONY: app smoke run clean
+.PHONY: app smoke run dist clean
 app: $(APP)/Contents/MacOS/Susurro
 
 # -parse-as-library because @main cannot coexist with top-level code.
-$(APP)/Contents/MacOS/Susurro: $(SRC) Info.plist bridge.h | $(B) $(FAR)/libFluidAudio.a
-	@mkdir -p $(APP)/Contents/MacOS
+$(APP)/Contents/MacOS/Susurro: $(SRC) Info.plist bridge.h models.sh | $(B) $(FAR)/libFluidAudio.a
+	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp Info.plist $(APP)/Contents/Info.plist
+	cp models.sh $(APP)/Contents/Resources/
 	$(SWIFTC) -parse-as-library $(SRC) $(LINK) -o $@
 	codesign --force --sign - --identifier dev.susurro $(APP)
 	@echo "built $(APP)"
@@ -40,6 +41,13 @@ smoke: | $(B) $(FAR)/libFluidAudio.a
 
 run: app
 	open $(APP)
+
+# What a beta tester receives. ditto, not zip: it keeps the code signature intact.
+dist: app
+	@mkdir -p build && rm -f build/Susurro.zip
+	ditto -c -k --keepParent $(APP) build/Susurro.zip
+	@echo "build/Susurro.zip — send this, with docs/INSTALL.md"
+
 
 $(B):
 	@echo "whisper libs missing — run ./setup.sh first" && exit 1

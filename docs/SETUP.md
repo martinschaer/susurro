@@ -45,7 +45,9 @@ that lib with plain `swiftc`.
 
 ## 1. Models
 
-`setup.sh` fetches into `~/.susurro/models/`:
+`models.sh` fetches into `~/.susurro/models/` — called by `setup.sh` here, and
+bundled into `Susurro.app/Contents/Resources` so a tester with no repo can run the
+same script from the menu bar:
 
 | File | From | Size |
 |---|---|---|
@@ -57,7 +59,7 @@ that lib with plain `swiftc`.
 | `wespeaker_v2.mlmodelc` | same repo | ~8 MB |
 
 The two `.mlmodelc` directories are the speaker embedding pipeline. FluidAudio would
-download them itself on first use; `setup.sh` pulls them up front so an always-on recorder
+download them itself on first use; `models.sh` pulls them up front so an always-on recorder
 never blocks on the network mid-session. Model licence is `cc-by-4.0`, SDK Apache 2.0.
 
 The Core ML encoder **must** sit beside the `.bin` as `<model>-encoder.mlmodelc`;

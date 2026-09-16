@@ -1,8 +1,8 @@
 # Susurro — spec
 
 Always-on local transcription of everything you say and hear on macOS, toggled from
-the menu bar. Personal prototype. Not shipped, not sandboxed, not signed for
-distribution.
+the menu bar. Personal prototype, handed to beta testers as an ad-hoc-signed zip
+(`make dist`, see docs/INSTALL.md). Not sandboxed, not notarised, not in any store.
 
 ## Scope
 
