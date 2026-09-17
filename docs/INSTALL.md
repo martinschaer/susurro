@@ -61,11 +61,20 @@ silently on login is worse than one you have to switch on.
 |---|---|
 | Transcripts | `~/.susurro/transcripts` — one JSONL file per meeting, `0700` |
 | Models | `~/.susurro/models` |
-| Speaker names | `~/.susurro/speakers.json` |
+| Voiceprints | `~/.susurro/speakers.json` — how a voice is recognised again, `0600` |
+| Speaker names | a `name` field on the transcript's own lines |
+| Meeting in progress | `~/.susurro/live` — moved into `transcripts` when it ends |
 | Settings | `~/.susurro/config.json` — optional, every key has a default |
 
-Menu ▸ **Open transcripts…** opens the folder. Menu ▸ **Name speakers…** puts real names
-on the `user-N` voices, with a sample of what each one said to help you tell them apart.
+Menu ▸ **Open transcripts…** opens the folder. Menu ▸ **Name speakers…** puts real names on
+the `user-N` voices, one meeting at a time, with a sample of what each one said to help you
+tell them apart.
+
+**Names belong to one meeting.** `user-4` is a voice the app learned to recognise, not a
+person — over weeks it will sometimes file two people under one `user-N`, so a name that is
+right in Tuesday's call can be wrong in Friday's. Naming somebody changes that meeting and
+no other. What it does do is remember: the next time that voice turns up, the names you have
+already used are offered as suggestions, with the most-used first.
 
 ## Known rough edges
 

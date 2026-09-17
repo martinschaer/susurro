@@ -27,6 +27,8 @@ tests beyond one smoke check.
 | VAD | whisper.cpp built-in Silero v5.1.2 | Kills whisper's silence hallucinations |
 | Speakers | FluidAudio (pyannote community-1 + WeSpeaker) via Core ML | 256-d embeddings on the ANE; matching layer already tuned |
 | Speaker identity | Cosine match against `~/.susurro/speakers.json` | Diarizers renumber every run; only a persisted embedding survives the night |
+| Speaker names | On the transcript's own lines, per transcript | A `user-N` is a voiceprint cluster, not a person: across days clusters merge people, so one global name is wrong somewhere |
+| Live transcript | Written in `~/.susurro/live`, moved out when the meeting ends | Naming rewrites the whole file; the engine holds an open handle at a cached offset, so the file it is appending to must be somewhere nothing else touches |
 | Storage | `~/.susurro/transcripts/YYYY-MM-DD_HH-MM-SS.jsonl` | Append-only, greppable, one file per meeting |
 | Sandbox | **Off** | Sandboxed app can't write `~/.susurro` |
 
@@ -229,8 +231,38 @@ one line per segment, appended, `fsync`ed per write:
 ```
 
 `source` is `"mic"` (you) or `"system"` (what you heard). `speaker` is `"me"` for the mic
-stream — no embedding beats knowing which microphone it came from — and `user-N`,
-a name from `speakers.json`, or `"unknown"` for the system stream.
+stream — no embedding beats knowing which microphone it came from — and `user-N` or
+`"unknown"` for the system stream.
+
+`speaker` is never a *global* name. A name is an opinion about one recording; a single
+name per gallery entry applies it retroactively to every other meeting the same cluster
+appears in, which is the thing that is wrong. The name for this meeting goes in its own
+field, added afterwards by the naming window:
+
+```json
+{"ts":"…","source":"system","speaker":"user-2","name":"Ana","dist":0.31,"dur":3.42,"lang":"es","text":"…"}
+```
+
+`name` is absent until somebody says. In the line and not in a sidecar so the transcript is
+self-describing: whatever reads it next — a script, an agent — gets the name without being
+told where else to look. Transcripts written before the field existed carry a name in
+`speaker` instead; they still read, as a voice whose label happens to be `Ana`. No
+migration, beyond one-shot adoption of the `.names.json` sidecars an earlier build wrote.
+
+Naming rewrites the whole file, which is only safe because **a transcript being appended to
+is not in this directory**. `Transcriber` writes to `~/.susurro/live/<stamp>.jsonl` and
+moves the file to `~/.susurro/transcripts/` when the meeting ends — on the session-gap
+rotation, at `close()`, and, for anything a crash stranded, at the next launch. The handle
+keeps a cached offset from `seekToEndOfFile()` and does not reopen per line, so a rewrite
+underneath it would land the next append in the middle of the file. Segregating by
+directory makes that impossible rather than unlikely, and means the naming window needs no
+reference to the engine to know what is live. A sibling directory and not a subdirectory,
+so a recursive scan of the transcripts cannot find the one file that is still moving.
+
+The rewrite is atomic, returns lines it cannot decode byte for byte, and is 13 ms on the
+largest transcript here — which is why the window writes on commit rather than per
+keystroke. `JSONEncoder` does not emit keys in declaration order, so a rewritten line is
+reordered; same object, different byte layout.
 
 `dist` is the cosine distance to the matched speaker, and it is written **so that a bad
 day is re-clusterable offline** rather than baked into the transcript. It is absent when
@@ -254,7 +286,7 @@ created on first write, so a session where nobody spoke leaves nothing behind.
 [✓] Listening          ⌘L      → toggles capture
     ─────────────────
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
-    Name speakers…             → one Window scene: roster, then one voice at a time
+    Name speakers…             → one Window scene: meetings, then the voices in one
     ─────────────────
     Quit Susurro       ⌘Q
 ```
@@ -279,10 +311,10 @@ susurro/
   bridge.h              #include of whisper.h, via -import-objc-header
   Info.plist
   Sources/
-    SusurroApp.swift    MenuBarExtra, enable/disable wiring
+    SusurroApp.swift    MenuBarExtra, enable/disable wiring, the naming window
     Capture.swift       mic + system tap + segmenter
     Transcriber.swift   whisper context, serial queue, JSONL append
-    Speaker.swift       embedding + persisted gallery
+    Speaker.swift       embedding + persisted gallery + per-transcript names
     smoke.swift         built separately, not part of the app
   vendor/whisper.cpp/   shallow clone + build-mac/
   vendor/fluidaudio/    shallow clone at v0.15.5 + .build/ (SwiftPM -> one .a)
@@ -322,23 +354,46 @@ files; too high and two back-to-back meetings become one.
 
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
 
-Naming is not: *Name speakers…* lists the gallery read-only — a `user-N` and either its
-name or `unnamed` — because a bare id is unnamable; nobody remembers which id was Ana.
-Clicking a row opens that one voice: a name field, and 10 lines sampled at random from the
-transcripts where it appears, with a button for another 10. Clicking a line expands it to
-the turn either side, labelled with who said it — `me` on both sides means this voice was
-answering you, which places it faster than the line alone does. Neighbours come from the
-same file, so never across meetings; segments are cut on silence, so "the line before" is
-sometimes the same person's previous segment rather than somebody else's turn. That is the
-identification — you recognise what somebody said, and who they said it to. From the rename on, every later line says `Ana`. Lines
-already written keep the old label, so the sample matches both `user-N` and the current
-name. Hand-editing `name` in `~/.susurro/speakers.json` still works and is the same
-operation — the window is only a read-modify-write of that file, which is why it needs no
-models loaded and works with Listening off. Reading the snippets is the same trick applied
-to the transcripts: a directory scan and a JSONL decode, no whisper context. `SpeakerBook` re-reads the names before it writes, so a rename survives the
-running session flushing its drifted centroids; it reaches the live labels at that flush,
-not the instant you click Save. The transcripts are append-only; nothing rewrites a label
-that is already on disk.
+Naming is not, and it is per transcript. *Name speakers…* opens the list of meetings —
+date, how many voices, how many are still unnamed — because the meeting is what makes a
+`user-N` answerable: nobody remembers which FluidAudio id was Ana, but everybody remembers
+who was in Tuesday's call.
+
+Clicking a meeting lists its voices: `user-N`, a name field, a suggestions button, and the
+longest line that voice said, which identifies far better than its first ("yeah"). A name is
+written on Return, on picking a suggestion, and on leaving the view — the last of those
+because a name typed and then navigated away from used to be dropped silently, which reads
+exactly like naming being broken. Not per keystroke: each write rewrites the transcript. A
+blank field **clears** the name: getting one wrong is the normal case here, and there would
+otherwise be no way to take it back.
+
+The meeting in progress is not in the list, because it is not in the directory yet. That is
+the same fact that makes the rewrite safe.
+
+The stack is driven by an explicit `NavigationPath`, not by `NavigationLink`s. A link inside
+a `List` row hands the whole row to navigation, and it ate every click meant for the name
+field and the suggestions menu sitting in that row.
+
+The suggestions are the record of speakers, and the only reason the gallery still matters
+to a human. A voice you called Ana in four meetings offers `Ana (4)`; ties break
+alphabetically; the meeting being named never votes for itself. That is a hint and never
+an assignment — nothing is written until you type or pick and press Save, so a cluster that
+quietly merged two people cannot rename one of them into the other behind your back.
+
+Clicking a voice's sample line opens everything it said in that meeting, in order, each
+line expandable to the turn either side, labelled with who said it — `me` on both sides
+means this voice was answering you, which places it faster than the line alone does.
+Complete and chronological rather than a random sample, because one meeting is a bounded
+amount of text and read in order it is a conversation. Neighbours come from the same file,
+so never across meetings; segments are cut on silence, so "the line before" is sometimes
+the same person's previous segment rather than somebody else's turn.
+
+Hand-editing a `name` field is the same operation and still works — the window is only a
+read-modify-write of that file, which is why it needs no models loaded and works with
+Listening off. Reading the lines is the same trick applied to the transcripts: a directory
+scan and a JSONL decode, no whisper context. Nothing here touches `speakers.json`: the
+gallery owns the voiceprint, the sidecar owns the name, and the two never write to each
+other. The transcripts are append-only; nothing rewrites a label that is already on disk.
 
 ## Known limitations
 
@@ -369,11 +424,7 @@ Accepted for a prototype, listed so they are not rediscovered as bugs:
    and to start false-merging as strangers accumulate, since each false merge poisons a
    centroid and causes the next. `dist` in the JSONL is there so a bad stretch can be
    re-clustered offline.
-9. **A voice renamed twice loses its middle-era snippets.** The transcripts record the
-   label as it was at write time, and only the current name plus `user-N` are searched, so
-   the lines written under a discarded name are not sampled. Renaming once — the normal
-   case — is unaffected.
-10. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
+9. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
    not to this. It lives at `0700`/`0600` beside the transcripts, and deleting the file
    forgets everyone.
 
@@ -390,13 +441,27 @@ reopen, and that a decimated (~1.2× pitch) copy becomes `user-2`. That last one
 only check that catches an embedder returning a constant vector, which would collapse
 everyone into `user-1` while every other assertion still passed.
 
-The snippet checks need no models at all. Two hand-written JSONL fixtures assert that an
-unnamed voice matches only its `user-N` lines and a renamed one both its name and its
-`user-N` lines, that both files are scanned, and that context is the genuinely adjacent
-line: a match at a file boundary reports no neighbour, and one next to an undecodable line
-reports no neighbour rather than the next readable line along. That last one is the whole
-reason the decode keeps `[Line?]` instead of compacting — with `compactMap` it fails,
-quoting the wrong speaker.
+The transcript-reading checks need no models at all. Three hand-written JSONL fixtures
+assert the roster (meetings newest first, `me` excluded from the voices, the sample being
+the longest line and not the first, only decodable lines counted), and that context is the
+genuinely adjacent line: a line at a file boundary reports no neighbour, and one next to
+an undecodable line reports no neighbour rather than the next readable line along. That
+last one is the whole reason the decode keeps `[Line?]` instead of compacting — with
+`compactMap` it fails, quoting the wrong speaker.
+
+The naming checks are the ones that matter most, because the bug they guard is silent. The
+same `user-1` is named `Ana` in one fixture and `Bruno` in another, and each transcript
+must read back its own — that assertion fails the moment a name leaks across transcripts
+again. Alongside it: the name lands on the line itself, a rewrite returns an undecodable
+line byte for byte and loses none of the readable ones, a blank names nobody, clearing
+removes one name and leaves its neighbour alone, an old `.names.json` is folded in and
+deleted, and `suggestions` tallies `Ana (2), Bruno (1)` without the meeting being named
+voting for itself.
+
+With models loaded: an open transcript is in the live directory and nowhere else, `close`
+publishes it and only then, a file stranded in `live` is published at the next launch, and
+naming a voice then reopening the gallery still identifies it as id `1` — so no name can
+find its way back into a written line.
 
 Both targets build with `-parse-as-library` and carry their own `@main`; `smoke.swift`
 links `Capture.swift` + `Transcriber.swift` instead of `SusurroApp.swift`. Top-level code

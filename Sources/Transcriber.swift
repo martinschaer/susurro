@@ -22,8 +22,16 @@ final class Transcriber {
     private let gapSec: Double
 
     private var handle: FileHandle?
+    private var live: URL?                 // the file `handle` is open on, in `liveDir`
     private var lastWrite = Date.distantPast
     private var closed = false
+
+    /// Where a transcript lives *while it is being written*. Not a detail: naming a voice
+    /// rewrites the whole file, and this handle keeps a cached offset from
+    /// `seekToEndOfFile()` that a rewrite underneath it would leave pointing mid-file, so
+    /// the next append would overwrite real lines. Keeping the open file out of the
+    /// directory anything else reads makes that impossible rather than unlikely.
+    private let liveDir: URL
 
     /// Seconds, not minutes: an off/on inside the same minute must not reopen the
     /// previous session's file.
@@ -42,7 +50,8 @@ final class Transcriber {
     }()
 
     init?(model: URL, vad: URL?, speakers: SpeakerBook? = nil, gapSec: Double = 300,
-          dir: URL = Transcriber.defaultDir) {
+          dir: URL = Transcriber.defaultDir, liveDir: URL = Transcriber.defaultLiveDir) {
+        self.liveDir = liveDir
         self.gapSec = gapSec
         var cp = whisper_context_default_params()
         cp.use_gpu = true              // Metal is off at build time; the Core ML
@@ -53,13 +62,22 @@ final class Transcriber {
         self.speakers = speakers
         vadPath = vad.flatMap { strdup($0.path) }
         autoLang = strdup("auto")
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
+        for d in [dir, liveDir] {
+            try? FileManager.default.createDirectory(
+                at: d, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+        }
+        publishStragglers()
     }
 
     static var defaultDir: URL {
         URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/transcripts")
+    }
+
+    /// A sibling of `defaultDir`, not a subdirectory of it: anything scanning the
+    /// transcripts recursively must not find the one file that is still moving.
+    static var defaultLiveDir: URL {
+        URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/live")
     }
 
     /// Hand a finished segment over for transcription. Returns immediately.
@@ -76,6 +94,7 @@ final class Transcriber {
         whisper_free(ctx)
         try? handle?.close()
         handle = nil
+        publish()                     // this meeting is over; it can be named now
         free(vadPath)
         free(autoLang)
     }
@@ -116,11 +135,16 @@ final class Transcriber {
         // "mic" is you — a fact no embedding can improve on. Only the system stream needs
         // matching. Doing it after the empty-text guard means the gallery only ever learns
         // from audio whisper agreed was speech.
+        //
+        // `user-N` and never a name, even once somebody has named this voice. The gallery
+        // clusters voiceprints, and the same cluster is a different person in a different
+        // meeting; who they were *here* lives in this file's `TranscriptNames` sidecar and
+        // is joined on this id at read time.
         var speaker = "me"
         var dist: Float?
         if source == "system" {
             let match = speakers?.label(samples)
-            speaker = match?.name ?? "unknown"
+            speaker = match.map { "user-\($0.id)" } ?? "unknown"
             dist = match?.dist
         }
 
@@ -130,12 +154,6 @@ final class Transcriber {
 
     // MARK: - storage
 
-    private struct Line: Encodable {
-        let ts: String, source: String, speaker: String
-        let dist: Double?
-        let dur: Double, lang: String, text: String
-    }
-
     private func append(_ text: String, source: String, speaker: String, dist: Float?,
                         dur: Double, lang: String) {
         // One file per meeting. Nothing runs while nobody is talking, so the gap between
@@ -144,7 +162,11 @@ final class Transcriber {
         let now = Date()
         if handle == nil || now.timeIntervalSince(lastWrite) > gapSec {
             try? handle?.close()
-            handle = Self.openFile(Self.fileFmt.string(from: now), in: dir)
+            publish()                  // the meeting that just ended
+            let url = liveDir.appendingPathComponent(
+                "\(Self.fileFmt.string(from: now)).jsonl")
+            handle = Self.openFile(url)
+            live = handle == nil ? nil : url
         }
         lastWrite = now                // before the guard below: a dropped line must not
                                        // strand the clock at the previous session
@@ -152,16 +174,40 @@ final class Transcriber {
         // the `try?` below would turn into a silently dropped line, for every speaker's
         // first appearance. Omit the field instead.
         let d = dist.map(Double.init).flatMap { $0.isFinite ? ($0 * 1000).rounded() / 1000 : nil }
-        let line = Line(ts: Self.isoFmt.string(from: now), source: source, speaker: speaker,
-                        dist: d, dur: (dur * 100).rounded() / 100, lang: lang, text: text)
+        let line = TranscriptLine(ts: Self.isoFmt.string(from: now), source: source,
+                                  speaker: speaker, dist: d,
+                                  dur: (dur * 100).rounded() / 100, lang: lang, text: text,
+                                  name: nil)
         guard let data = try? JSONEncoder().encode(line), let h = handle else { return }
         h.write(data)
         h.write(Data([0x0a]))
         try? h.synchronize()
     }
 
-    private static func openFile(_ stamp: String, in dir: URL) -> FileHandle? {
-        let url = dir.appendingPathComponent("\(stamp).jsonl")
+    /// Hand a finished transcript over to the readers. Nothing appends to it after this,
+    /// which is exactly what makes naming — a whole-file rewrite — safe.
+    private func publish() {
+        guard let url = live else { return }
+        live = nil
+        try? FileManager.default.moveItem(
+            at: url, to: dir.appendingPathComponent(url.lastPathComponent))
+    }
+
+    /// Anything already in `liveDir` belongs to a process that is no longer running — a
+    /// crash, or a quit that never reached `close`. It is finished by definition.
+    ///
+    /// ponytail: a name collision leaves the file where it is, and it is retried next
+    /// launch. Stamps are second-resolution, so two would need the same second on two runs.
+    private func publishStragglers() {
+        let all = (try? FileManager.default.contentsOfDirectory(
+            at: liveDir, includingPropertiesForKeys: nil)) ?? []
+        for url in all where url.pathExtension == "jsonl" {
+            try? FileManager.default.moveItem(
+                at: url, to: dir.appendingPathComponent(url.lastPathComponent))
+        }
+    }
+
+    private static func openFile(_ url: URL) -> FileHandle? {
         let fm = FileManager.default
         if !fm.fileExists(atPath: url.path) {
             fm.createFile(atPath: url.path, contents: nil,

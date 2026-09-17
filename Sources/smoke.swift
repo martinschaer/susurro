@@ -35,72 +35,141 @@ enum Smoke {
         quietSeg.push(quiet(3.0))
         check(none.isEmpty, "silence produces no segments")
 
-        // MARK: snippets — what the naming window shows, minus the window
+        // MARK: transcripts — what the naming window reads, minus the window
         //
         // No models needed, so this runs even on a bare checkout. Its own directory: the
         // gap check at the bottom counts files in `out`.
         let snips = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("susurro-snips-\(getpid())")
         try FileManager.default.createDirectory(at: snips, withIntermediateDirectories: true)
+        let a = snips.appendingPathComponent("2026-01-01_09-00-00.jsonl")
+        let b = snips.appendingPathComponent("2026-01-02_14-30-00.jsonl")
+
         // An exchange, because the context either side is the point. Last line truncated,
         // as a file the engine is still appending to would be.
         try """
         {"ts":"2026-01-01T09:00:00+01:00","source":"mic","speaker":"me","text":"so what do you think"}
-        {"ts":"2026-01-01T09:01:00+01:00","source":"system","speaker":"user-1","text":"before the rename"}
-        {"ts":"2026-01-01T09:02:00+01:00","source":"system","speaker":"Ana","text":"after the rename"}
+        {"ts":"2026-01-01T09:01:00+01:00","source":"system","speaker":"user-1","text":"the short one"}
+        {"ts":"2026-01-01T09:02:00+01:00","source":"system","speaker":"user-1","text":"the longest thing this voice said, which is the one worth showing"}
         {"ts":"2026-01-01T09:03:00+01:00","source":"system","speaker":"user-2","text":"somebody else"}
         not json at all
         {"ts":"2026-01-01T09:05:00+01:00","source":"system","speaker":"user-1","text":"after the gap"}
         {"ts":"2026-01-01T09:06:00+01:00","source":"system","speaker":"user-1","tex
-        """.write(to: snips.appendingPathComponent("a.jsonl"), atomically: true, encoding: .utf8)
+        """.write(to: a, atomically: true, encoding: .utf8)
         // A second meeting, one line long: a neighbour must never cross a file.
         try """
-        {"ts":"2026-01-02T09:00:00+01:00","source":"system","speaker":"user-1","text":"alone in its file"}
-        """.write(to: snips.appendingPathComponent("b.jsonl"), atomically: true, encoding: .utf8)
+        {"ts":"2026-01-02T14:30:00+01:00","source":"system","speaker":"user-1","text":"alone in its file"}
+        """.write(to: b, atomically: true, encoding: .utf8)
 
-        // FluidAudio's default name for id 1, i.e. nobody has renamed this voice yet.
-        let anon = Speaker(id: "1", name: "Speaker 1", currentEmbedding: [1, 0, 0])
-        let anonSnips = TranscriptSnippets.random(for: anon, dir: snips)
-        check(Set(anonSnips.map(\.line.text))
-                == ["before the rename", "after the gap", "alone in its file"],
-              "an unnamed voice matches its user-N lines, across files "
-              + "(got \(anonSnips.map(\.line.text)))")
+        // MARK: the roster — one row per meeting, newest first
+        let meetings = TranscriptSnippets.meetings(dir: snips)
+        check(meetings.map { $0.url.lastPathComponent }
+                == [b, a].map { $0.lastPathComponent },
+              "meetings come back newest first "
+              + "(got \(meetings.map { $0.url.lastPathComponent }))")
+        check(meetings[0].stamp == "2026-01-02 14:30",
+              "the file name reads as a date and a time (got \(meetings[0].stamp))")
+        check(meetings[1].lines == 5,
+              "only decodable lines are counted (got \(meetings[1].lines))")
 
-        // Renamed: the pre-rename lines still say user-1 and must not be lost.
-        let ana = Speaker(id: "1", name: "Ana", currentEmbedding: [1, 0, 0])
-        let anaSnips = TranscriptSnippets.random(for: ana, dir: snips)
-        check(Set(anaSnips.map(\.line.text)) == ["before the rename", "after the rename",
-                                                 "after the gap", "alone in its file"],
-              "a renamed voice matches both its name and its user-N lines")
-        check(TranscriptSnippets.random(for: ana, count: 1, dir: snips).count == 1,
-              "count caps the sample")
+        let voices = meetings[1].voices
+        check(voices.map(\.label) == ["user-1", "user-2"],
+              "every voice in the meeting, and `me` is not one of them "
+              + "(got \(voices.map(\.label)))")
+        check(voices[0].lines == 3, "lines per voice (got \(voices[0].lines))")
+        check(voices[0].sample.hasPrefix("the longest thing"),
+              "the sample is the longest line, not the first (got \(voices[0].sample))")
 
-        // MARK: snippet context — the turn either side, which is what identifies a voice
-        guard let mid = anonSnips.first(where: { $0.line.text == "before the rename" }) else {
-            print("  FAIL  sampled line missing"); exit(1)
-        }
-        check(mid.before?.speaker == "me" && mid.before?.text == "so what do you think",
-              "the previous turn comes back with whose it was (got \(mid.before as Any))")
-        check(mid.after?.text == "after the rename",
-              "the next turn comes back too (got \(mid.after as Any))")
-
-        // First and last line of its file: no context, and the truncated tail of the *other*
-        // file must not leak in as a neighbour.
-        guard let lone = anonSnips.first(where: { $0.line.text == "alone in its file" }) else {
-            print("  FAIL  second file not scanned"); exit(1)
-        }
-        check(lone.before == nil && lone.after == nil,
-              "a file-boundary line has no neighbours rather than the wrong ones")
+        // MARK: one voice in one meeting — in order, with the turn either side
+        let said = TranscriptSnippets.lines(for: "user-1", in: a)
+        check(said.map(\.line.text)
+                == ["the short one", "the longest thing this voice said, which is the one "
+                    + "worth showing", "after the gap"],
+              "every line this voice spoke here, in order (got \(said.map(\.line.text)))")
+        check(said[0].before?.speaker == "me" && said[0].before?.text == "so what do you think",
+              "the previous turn comes back with whose it was (got \(said[0].before as Any))")
+        check(said[0].after?.text.hasPrefix("the longest thing") == true,
+              "the next turn comes back too (got \(said[0].after as Any))")
 
         // An undecodable line mid-file must not shift the lines after it. `compactMap`
         // instead of `map` would drop it, close the gap, and quote "somebody else" — the
         // wrong person — as what came before this one. Both sides are unreadable here.
-        guard let gapped = anonSnips.first(where: { $0.line.text == "after the gap" }) else {
-            print("  FAIL  line after an unreadable one not sampled"); exit(1)
-        }
-        check(gapped.before == nil && gapped.after == nil,
+        check(said[2].before == nil && said[2].after == nil,
               "an unreadable neighbour is no context, not the next one along "
-              + "(got \(gapped.before as Any) / \(gapped.after as Any))")
+              + "(got \(said[2].before as Any) / \(said[2].after as Any))")
+
+        // First and last line of its file: no context, and the truncated tail of the *other*
+        // file must not leak in as a neighbour.
+        let lone = TranscriptSnippets.lines(for: "user-1", in: b)
+        check(lone.count == 1 && lone[0].before == nil && lone[0].after == nil,
+              "a file-boundary line has no neighbours rather than the wrong ones")
+
+        // MARK: naming — the whole point: a name belongs to one transcript
+        //
+        // The same `user-1` is Ana on Thursday and Bruno on Friday, because a `user-N` is a
+        // voiceprint cluster and clusters merge people. This is the check that fails if a
+        // name ever leaks back across transcripts.
+        TranscriptNames.apply(["user-1": "Ana", "user-2": "  "], to: a)
+        TranscriptNames.apply(["user-1": "Bruno"], to: b)
+        check(TranscriptNames.load(for: a)["user-1"] == "Ana"
+                && TranscriptNames.load(for: b)["user-1"] == "Bruno",
+              "the same voice is named per transcript, not once for all of them")
+        check(TranscriptNames.load(for: a)["user-2"] == nil, "a blank field names nobody")
+
+        // The whole reason the name is in the file: whatever reads the transcript next
+        // gets it without being told where else to look.
+        let namedBody = try String(contentsOf: a, encoding: .utf8)
+        check(namedBody.contains("\"name\":\"Ana\""),
+              "the name is on the transcript line itself")
+        check(namedBody.contains("not json at all")
+                && namedBody.hasSuffix("\"user-1\",\"tex"),
+              "a rewrite returns the lines it cannot read byte for byte")
+        check(TranscriptSnippets.decode(a).compactMap { $0 }.count == 5,
+              "and loses none of the ones it can")
+
+        // Clearing is the correction path, and the only way to take a wrong name back.
+        TranscriptNames.apply(["user-2": "Cleo"], to: a)
+        TranscriptNames.apply(["user-2": ""], to: a)
+        check(TranscriptNames.load(for: a) == ["user-1": "Ana"],
+              "a cleared name is removed and its neighbour left alone "
+              + "(got \(TranscriptNames.load(for: a)))")
+
+        // MARK: suggestions — the record of speakers, which is what makes a `user-N` guessable
+        let c = snips.appendingPathComponent("2026-01-03_09-00-00.jsonl")
+        try """
+        {"ts":"2026-01-03T09:00:00+01:00","source":"system","speaker":"user-1","text":"a third meeting"}
+        """.write(to: c, atomically: true, encoding: .utf8)
+        TranscriptNames.apply(["user-1": "Ana"], to: c)
+
+        let named = TranscriptSnippets.meetings(dir: snips)
+        check(named.first { $0.url.lastPathComponent == a.lastPathComponent }?
+                .voices.first?.name == "Ana",
+              "the roster reads the name back off the transcript")
+
+        let hints = TranscriptSnippets.suggestions(for: "user-1", in: named)
+        check(hints == [.init(name: "Ana", count: 2), .init(name: "Bruno", count: 1)],
+              "names this voice went by elsewhere, most-used first (got \(hints))")
+        check(TranscriptSnippets.suggestions(for: "user-1", excluding: c, in: named)
+                == [.init(name: "Ana", count: 1), .init(name: "Bruno", count: 1)],
+              "the transcript being named does not vote for itself, and a tie is "
+              + "alphabetical")
+        check(TranscriptSnippets.suggestions(for: "user-9", in: named).isEmpty,
+              "a voice nobody has ever named suggests nothing")
+
+        // MARK: the old sidecars are folded in, not stripped
+        let d = snips.appendingPathComponent("2026-01-04_09-00-00.jsonl")
+        try """
+        {"ts":"2026-01-04T09:00:00+01:00","source":"system","speaker":"user-5","text":"from before the move"}
+        """.write(to: d, atomically: true, encoding: .utf8)
+        try #"{"user-5":"Dylan"}"#
+            .write(to: snips.appendingPathComponent("2026-01-04_09-00-00.names.json"),
+                   atomically: true, encoding: .utf8)
+        TranscriptNames.adoptSidecars(in: snips)
+        check(TranscriptNames.load(for: d)["user-5"] == "Dylan",
+              "a name written when names lived in a sidecar survives the move into the file")
+        check(TranscriptSnippets.meetings(dir: snips).count == 4,
+              "and the sidecar is gone rather than left to be re-applied forever")
+
         try? FileManager.default.removeItem(at: snips)
 
         // MARK: Transcriber — jfk.wav all the way to JSONL on disk
@@ -113,6 +182,9 @@ enum Smoke {
 
         let out = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("susurro-smoke-\(getpid())")
+        // Its own live directory, emphatically. The default is `~/.susurro/live`, and
+        // `publishStragglers` would move a real stranded meeting into this temp dir.
+        let hot = out.appendingPathComponent("live")
         let gallery = out.appendingPathComponent("speakers.json")
         let models = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models")
 
@@ -121,7 +193,8 @@ enum Smoke {
         let book = SpeakerBook(models: models, threshold: 0.65, url: gallery)
         if book == nil { print("  SKIP  speaker labels (no speaker models — run ./setup.sh)") }
 
-        guard let t = Transcriber(model: model, vad: nil, speakers: book, dir: out) else {
+        guard let t = Transcriber(model: model, vad: nil, speakers: book, dir: out,
+                                  liveDir: hot) else {
             print("  FAIL  model load"); exit(1)
         }
 
@@ -137,14 +210,29 @@ enum Smoke {
         t.submit(pcm, source: "mic")
         t.submit(pcm, source: "system")
         t.submit(pcm, source: "system")
-        t.close()                                   // drains the queue, flushes the gallery
 
-        func transcripts() -> [URL] {
+        func jsonl(_ dir: URL) -> [URL] {
             let all = try? FileManager.default.contentsOfDirectory(
-                at: out, includingPropertiesForKeys: nil)
+                at: dir, includingPropertiesForKeys: nil)
             return (all ?? []).filter { $0.pathExtension == "jsonl" }
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
         }
+
+        // The whole reason naming can rewrite a file: while `Transcriber` holds it open at
+        // a cached offset it is not in the directory anything else reads. A rewrite there
+        // would leave the next append landing mid-file.
+        //
+        // `submit` is async, so wait for the first line rather than racing it.
+        for _ in 0..<600 where jsonl(hot).isEmpty { usleep(50_000) }
+        check(jsonl(hot).count == 1 && jsonl(out).isEmpty,
+              "an open transcript is in the live directory and nowhere else "
+              + "(live \(jsonl(hot).count), published \(jsonl(out).count))")
+
+        t.close()                                   // drains the queue, flushes the gallery
+        check(jsonl(hot).isEmpty && jsonl(out).count == 1,
+              "closing publishes it, and only then")
+
+        func transcripts() -> [URL] { jsonl(out) }
 
         // Three submits seconds apart are one meeting, hence one file.
         check(transcripts().count == 1,
@@ -185,7 +273,7 @@ enum Smoke {
             guard let reopened = SpeakerBook(models: models, threshold: 0.65, url: gallery)
             else { print("  FAIL  could not reopen gallery"); exit(1) }
             let tail = Array(pcm[(pcm.count / 2)...])
-            check(reopened.label(tail)?.name == "user-1",
+            check(reopened.label(tail)?.id == "1",
                   "reloaded gallery still matches a later slice of the same voice")
 
             // Catches the one failure every check above would survive: an embedder
@@ -193,7 +281,7 @@ enum Smoke {
             // every 6th sample raises rate and pitch ~1.2x, which moves the formants.
             var pitched: [Float] = []
             for (i, v) in pcm.enumerated() where i % 6 != 0 { pitched.append(v) }
-            check(reopened.label(pitched)?.name == "user-2",
+            check(reopened.label(pitched)?.id == "2",
                   "a different voice becomes a different speaker")
 
             // MARK: drift — does `drift` actually reach the clustering
@@ -245,35 +333,46 @@ enum Smoke {
                 .contains { $0 != $1 }
             check(!moved, "a settled voiceprint stops moving (25 matches, drift wide open)")
 
-            // MARK: naming — what the window does, minus the window
-            SpeakerNames.save(["1": "Ana", "2": "  "], to: gallery)
-            let renamed = SpeakerNames.load(from: gallery)
-            check(renamed.first { $0.id == "1" }?.name == "Ana", "rename by id landed")
-            check(renamed.first { $0.id == "2" }?.isNamed == false, "a blank field renames nobody")
-            check(renamed.allSatisfy { $0.currentEmbedding.count == 256 },
-                  "renaming kept every voiceprint")
-
-            guard let named = SpeakerBook(models: models, threshold: 0.65, url: gallery)
-            else { print("  FAIL  could not reopen renamed gallery"); exit(1) }
-            check(named.label(tail)?.name == "Ana", "the typed name is what the transcript records")
-
-            // Renamed behind a live book's back, then flushed: the rename has to win.
-            SpeakerNames.save(["2": "Bruno"], to: gallery)
-            named.close()
-            check(SpeakerNames.load(from: gallery).first { $0.id == "2" }?.name == "Bruno",
-                  "a flush of drifted centroids does not revert a rename")
+            // MARK: names stay out of the transcript
+            //
+            // Naming a voice must change what the *reader* sees and nothing the engine
+            // writes. If a name ever reaches this label again, it is baked into every
+            // later line and one rename retroactively renames every meeting — the bug the
+            // sidecar exists to prevent.
+            TranscriptNames.apply(["user-1": "Ana"], to: transcripts()[0])
+            guard let after = SpeakerBook(models: models, threshold: 0.65, url: gallery)
+            else { print("  FAIL  could not reopen gallery"); exit(1) }
+            check(after.label(tail)?.id == "1",
+                  "a named voice still identifies as an id, not a name "
+                  + "(got \(after.label(tail)?.id as Any))")
+            after.close()
+            check(TranscriptNames.load(for: transcripts()[0])["user-1"] == "Ana",
+                  "flushing the gallery does not disturb the transcript's names")
+            check(SpeakerNames.load(from: gallery).allSatisfy { $0.currentEmbedding.count == 256 },
+                  "and it keeps every voiceprint")
         }
 
         // A gap longer than `gapSec` starts a new file. gapSec: 0 makes any elapsed time
         // count as a gap; the sleep is only so the name lands in a different second.
         sleep(1)
-        guard let t2 = Transcriber(model: model, vad: nil, gapSec: 0, dir: out) else {
+        guard let t2 = Transcriber(model: model, vad: nil, gapSec: 0, dir: out,
+                                   liveDir: hot) else {
             print("  FAIL  reopen for gap check"); exit(1)
         }
         t2.submit(pcm, source: "mic")
         t2.close()
         check(transcripts().count == 2,
               "a silence gap starts a second file (got \(transcripts().count))")
+
+        // A meeting stranded by a crash is finished by definition: the next launch
+        // publishes it rather than leaving it where nothing reads it.
+        try "{\"ts\":\"x\",\"speaker\":\"user-1\",\"text\":\"orphaned\"}"
+            .write(to: hot.appendingPathComponent("2026-01-09_09-00-00.jsonl"),
+                   atomically: true, encoding: .utf8)
+        _ = Transcriber(model: model, vad: nil, dir: out, liveDir: hot)
+        check(jsonl(hot).isEmpty && transcripts().count == 3,
+              "a transcript stranded by a crash is published on the next launch "
+              + "(live \(jsonl(hot).count), published \(transcripts().count))")
 
         try? FileManager.default.removeItem(at: out)
         print("all checks passed")

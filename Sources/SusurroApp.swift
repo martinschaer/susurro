@@ -50,99 +50,254 @@ struct SusurroApp: App {
             Image(systemName: engine.listening ? "waveform" : "waveform.slash")
         }
 
-        Window("Speaker names", id: "speakers") { SpeakerNamesView() }
+        Window("Transcripts", id: "speakers") { TranscriptsView() }
             .windowResizability(.contentSize)
     }
 }
 
-/// Put a name on a voice. `user-3` in the transcripts is a FluidAudio id and only a human
-/// knows it is Ana; from the rename on, every later line says Ana. Older lines keep the id
-/// — the transcripts are append-only.
+/// Which voice, in which meeting. The pair is the key everything below is addressed by:
+/// naming `user-3` is naming them *here*, and the same id in another transcript is very
+/// possibly somebody else.
+private struct VoiceKey: Hashable {
+    let transcript: URL, voice: String
+}
+
+/// Every transcript, and who the voices in each one turned out to be.
 ///
-/// One reference type, read by both views, is what keeps a rename visible. Handing the
-/// detail view a `Speaker` and a refresh callback instead left it holding a value copy from
-/// before the rename: the roster kept saying `unnamed` and the field re-seeded itself blank
-/// off the stale copy. Views now carry the id — immutable — and look the voice up.
+/// One reference type, read by all three views, is what keeps a rename visible. Handing a
+/// detail view a value copy plus a refresh callback left it holding pre-rename state: the
+/// roster kept saying `unnamed` and the field re-seeded itself blank off the stale copy.
+/// Views carry a key — a URL, or a `VoiceKey` — and look the value up.
 @Observable
-final class Gallery {
-    private(set) var speakers: [Speaker] = []
+final class Transcripts {
+    private(set) var meetings: [TranscriptSnippets.Meeting] = []
 
-    /// The gallery grows while the window is closed, so this is called on every appearance.
-    func reload() { speakers = SpeakerNames.load() }
+    /// Transcripts accumulate while the window is closed, so this runs on every appearance.
+    func reload() {
+        TranscriptNames.adoptSidecars(in: Transcriber.defaultDir)   // one release's worth
+        meetings = TranscriptSnippets.meetings()
+    }
 
-    func speaker(_ id: String) -> Speaker? { speakers.first { $0.id == id } }
+    func meeting(_ url: URL) -> TranscriptSnippets.Meeting? { meetings.first { $0.url == url } }
 
-    func rename(_ id: String, to name: String) {
-        SpeakerNames.save([id: name])     // read-modify-write; a blank renames nobody
-        reload()
+    func voice(_ label: String, in transcript: URL) -> TranscriptSnippets.Voice? {
+        meeting(transcript)?.voices.first { $0.label == label }
+    }
+
+    func name(_ voice: String, in transcript: URL) -> String? {
+        self.voice(voice, in: transcript)?.name
+    }
+
+    /// How a line's `speaker` should read on screen: the name if this meeting has one, the
+    /// raw `user-N` otherwise.
+    func display(_ voice: String, in transcript: URL) -> String {
+        name(voice, in: transcript) ?? voice
+    }
+
+    func suggestions(for voice: String, in transcript: URL) -> [TranscriptSnippets.Suggestion] {
+        TranscriptSnippets.suggestions(for: voice, excluding: transcript, in: meetings)
+    }
+
+    /// Writes the names onto the transcript's own lines — a whole-file rewrite, which is
+    /// why the view calls this on commit and not on every keystroke.
+    func rename(_ voices: [String: String], in transcript: URL) {
+        guard !voices.isEmpty else { return }
+        TranscriptNames.apply(voices, to: transcript)
+        // Re-read the one file that changed, so the roster and the suggestions follow.
+        guard let i = meetings.firstIndex(where: { $0.url == transcript }),
+              let fresh = TranscriptSnippets.meetings(dir: transcript.deletingLastPathComponent())
+                  .first(where: { $0.url.lastPathComponent == transcript.lastPathComponent })
+        else { return }
+        meetings[i] = fresh
     }
 }
 
-/// The roster: every voice, read-only. A row is a `user-N` and nothing else identifying, so
-/// the naming happens one voice at a time in `SpeakerDetailView`, next to what it said.
-struct SpeakerNamesView: View {
-    @State private var gallery = Gallery()
+/// The roster: one row per meeting. Naming starts here rather than at a voice because the
+/// meeting is what makes a `user-N` answerable — you remember who was in Tuesday's call.
+struct TranscriptsView: View {
+    @State private var transcripts = Transcripts()
+
+    /// Driven explicitly rather than by `NavigationLink`s all the way down. A link inside a
+    /// `List` row hands the *whole row* to navigation, which ate every click meant for the
+    /// name field and the suggestions menu sitting in it.
+    @State private var path = NavigationPath()
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
-                if gallery.speakers.isEmpty {
-                    Text("No voices yet. The system stream enrols one the first time "
-                         + "somebody who is not you speaks.")
+                if transcripts.meetings.isEmpty {
+                    Text("No transcripts yet. Switch Listening on, and a file appears "
+                         + "the first time somebody speaks.")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(gallery.speakers) { s in
-                    NavigationLink(value: s.id) {
-                        HStack {
-                            Text("user-\(s.id)")
-                            Spacer()
-                            Text(s.isNamed ? s.name : "unnamed")
-                                .foregroundStyle(.secondary)
+                ForEach(transcripts.meetings) { m in
+                    NavigationLink(value: m.url) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(m.stamp)
+                            Text(subtitle(m)).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
             }
-            .navigationDestination(for: String.self) { id in
-                SpeakerDetailView(id: id, gallery: gallery)
+            .navigationDestination(for: URL.self) {
+                MeetingView(transcript: $0, transcripts: transcripts, path: $path)
+            }
+            .navigationDestination(for: VoiceKey.self) {
+                VoiceView(key: $0, transcripts: transcripts)
             }
         }
-        .frame(width: 420, height: 460)      // fixed, so pushing a view does not resize
-        .onAppear(perform: gallery.reload)
+        .frame(width: 460, height: 500)      // fixed, so pushing a view does not resize
+        .onAppear(perform: transcripts.reload)
+    }
+
+    /// Unnamed first, because that is the reason to open the row.
+    private func subtitle(_ m: TranscriptSnippets.Meeting) -> String {
+        let unnamed = m.voices.filter { transcripts.name($0.label, in: m.url) == nil }.count
+        let voices = "\(m.voices.count) voice\(m.voices.count == 1 ? "" : "s")"
+        return unnamed == 0 ? "\(voices) · \(m.lines) lines"
+                            : "\(unnamed) unnamed of \(voices) · \(m.lines) lines"
     }
 }
 
-/// One voice, with enough of what it said to recognise it.
-private struct SpeakerDetailView: View {
-    let id: String
-    let gallery: Gallery
+/// One meeting: name every voice in it. The name lands in this transcript's sidecar and
+/// nowhere else — the same `user-N` next week starts unnamed again, with whatever you
+/// typed here offered as a suggestion.
+private struct MeetingView: View {
+    let transcript: URL
+    let transcripts: Transcripts
+    @Binding var path: NavigationPath
 
-    @State private var typed = ""
-    @State private var snippets: [TranscriptSnippets.Snippet] = []
-    @State private var expanded: Set<Int> = []
+    /// What is being typed *right now*, by voice. Only that: the stored name is read
+    /// straight off `transcripts`, and this holds nothing until a key is pressed.
+    ///
+    /// Seeding it on appear instead is what made every field render empty. `.onAppear`
+    /// runs after the first layout, and the rows of a `List` did not pick the values up —
+    /// they arrived on the next keystroke, which is the one redraw nobody had to wait for.
+    /// Nothing in this view mutates state after a render any more.
+    @State private var typed: [String: String] = [:]
 
-    private var speaker: Speaker? { gallery.speaker(id) }
+    /// Voices edited since the last write. Saving a name rewrites the whole transcript, so
+    /// it happens on Enter, on picking a suggestion, and on leaving — never per keystroke.
+    @State private var dirty: Set<String> = []
+
+    private var voices: [TranscriptSnippets.Voice] { transcripts.meeting(transcript)?.voices ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                TextField("user-\(id)", text: $typed, prompt: Text("unnamed"))
-                Button("Save") { gallery.rename(id, to: typed) }
-                    .keyboardShortcut(.defaultAction)
-            }
-
-            HStack {
-                Text("What this voice said").font(.headline)
-                Spacer()
-                Button("Another 10") { shuffle() }
-            }
-
-            if snippets.isEmpty {
-                Text("No transcript lines for this voice yet.")
+            if voices.isEmpty {
+                Text("Only your own voice in this one — `me` needs no naming.")
                     .foregroundStyle(.secondary)
                 Spacer()
             } else {
+                List(voices) { row($0) }
+                Text("Saved when you press Return or leave. Clearing a name removes it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .navigationTitle(transcripts.meeting(transcript)?.stamp ?? "Transcript")
+        // Catches the edit that is typed and then navigated away from, which is how a name
+        // got silently dropped before there was anywhere to drop it from.
+        .onDisappear(perform: commit)
+    }
+
+    private func row(_ v: TranscriptSnippets.Voice) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(v.label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: 54, alignment: .trailing)
+                TextField(v.label, text: binding(v.label), prompt: Text("unnamed"))
+                    .textFieldStyle(.roundedBorder)   // or it reads as a label, not a field
+                    .onSubmit(commit)
+                suggestions(v.label)
+                // The way down, as its own button: everything this voice said here, with
+                // the turn either side.
+                Button {
+                    path.append(VoiceKey(transcript: transcript, voice: v.label))
+                } label: {
+                    Image(systemName: "chevron.right").font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("What this voice said")
+            }
+            // The sample is the identification: the longest thing it said, because the
+            // first thing is usually "yeah".
+            HStack(alignment: .top, spacing: 6) {
+                Text("\(v.lines)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 54, alignment: .trailing)
+                Text(v.sample).lineLimit(2).font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    /// Names this voice went by in other meetings. Empty for a voice nobody has ever named,
+    /// which is every voice until the first time somebody does — hence the disabled menu
+    /// rather than a missing control that moves the layout around.
+    private func suggestions(_ voice: String) -> some View {
+        Menu {
+            // Tallied here rather than cached in `@State`: the scan is a handful of
+            // forty-byte files, and state filled in after a render is the bug above.
+            let options = transcripts.suggestions(for: voice, in: transcript)
+            if options.isEmpty {
+                Text("No other meeting has named this voice")
+            }
+            ForEach(options) { s in
+                Button("\(s.name) (\(s.count))") { set(voice, to: s.name); commit() }
+            }
+        } label: {
+            Image(systemName: "person.crop.circle.badge.questionmark")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Named elsewhere — pick one")
+    }
+
+    private func set(_ voice: String, to name: String) {
+        typed[voice] = name
+        dirty.insert(voice)
+    }
+
+    /// Write every edited voice at once. Blank clears; see `TranscriptNames`.
+    private func commit() {
+        transcripts.rename(dirty.reduce(into: [:]) { $0[$1] = typed[$1] ?? "" },
+                           in: transcript)
+        dirty = []
+    }
+
+    /// Falls back to the stored name, so the very first render already shows it. The
+    /// buffer wins once there is one, or a half-typed "Ana " would lose its space to the
+    /// trim on the way to disk.
+    private func binding(_ voice: String) -> Binding<String> {
+        Binding(get: { typed[voice] ?? transcripts.name(voice, in: transcript) ?? "" },
+                set: { set(voice, to: $0) })
+    }
+}
+
+/// One voice in one meeting, in full and in order. Read as a conversation it identifies a
+/// speaker far better than the line alone: `me` either side means this voice was answering
+/// you, which places them faster than anything they said by themselves.
+private struct VoiceView: View {
+    let key: VoiceKey
+    let transcripts: Transcripts
+
+    @State private var snippets: [TranscriptSnippets.Snippet] = []
+    @State private var expanded: Set<Int> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if snippets.isEmpty {
+                Text("No lines for this voice.").foregroundStyle(.secondary)
+                Spacer()
+            } else {
                 // By index: a snippet is a line of text, and the same sentence can honestly
-                // turn up twice in one sample.
+                // turn up twice in one meeting.
                 List(snippets.indices, id: \.self) { i in
                     // A Button, not an onTapGesture, so a row stays keyboard-reachable.
                     Button { toggle(i) } label: { row(i) }
@@ -151,15 +306,12 @@ private struct SpeakerDetailView: View {
             }
         }
         .padding()
-        .navigationTitle(speaker.map { $0.isNamed ? $0.name : "user-\(id)" } ?? "user-\(id)")
-        .onAppear {
-            typed = speaker.flatMap { $0.isNamed ? $0.name : nil } ?? ""
-            shuffle()
-        }
+        .navigationTitle(transcripts.display(key.voice, in: key.transcript))
+        .onAppear { snippets = TranscriptSnippets.lines(for: key.voice, in: key.transcript) }
     }
 
-    /// One sampled line, collapsed to three lines of text; expanded, the turn either side
-    /// of it as well — chronological, so the exchange reads top to bottom.
+    /// One line, collapsed to three lines of text; expanded, the turn either side of it as
+    /// well — chronological, so the exchange reads top to bottom.
     private func row(_ i: Int) -> some View {
         let s = snippets[i]
         let open = expanded.contains(i)
@@ -190,8 +342,7 @@ private struct SpeakerDetailView: View {
         .contentShape(Rectangle())   // the gaps are part of the click target
     }
 
-    /// A neighbouring turn: whose it was is the whole point — `me` either side means this
-    /// voice was answering you.
+    /// A neighbouring turn: whose it was is the whole point.
     private func turn(_ t: TranscriptSnippets.Turn) -> some View {
         HStack(alignment: .top, spacing: 6) {
             speakerTag(t.speaker)
@@ -202,9 +353,10 @@ private struct SpeakerDetailView: View {
         .foregroundStyle(.secondary)
     }
 
-    /// Fixed width, trailing-aligned, so the three turns line up as a column.
+    /// Fixed width, trailing-aligned, so the three turns line up as a column. Resolved
+    /// through this meeting's sidecar: a neighbour you have named reads `Ana`, not `user-7`.
     private func speakerTag(_ who: String) -> some View {
-        Text(who)
+        Text(transcripts.display(who, in: key.transcript))
             .font(.caption)
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -215,11 +367,6 @@ private struct SpeakerDetailView: View {
 
     private func toggle(_ i: Int) {
         if expanded.contains(i) { expanded.remove(i) } else { expanded.insert(i) }
-    }
-
-    private func shuffle() {
-        expanded = []                // indices would otherwise point at the previous sample
-        snippets = speaker.map { TranscriptSnippets.random(for: $0) } ?? []
     }
 }
 
