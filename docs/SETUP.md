@@ -224,7 +224,7 @@ tail -f "$(ls -t ~/.susurro/transcripts/*.jsonl | head -1)"
 - speaker embeddings discriminate for real, not just structurally: two halves of `jfk.wav`
   match each other at cosine distance **0.11 / 0.15**, while the same audio decimated to
   ~1.2× pitch fails to match and mints a second speaker
-- the gallery round-trips — labels survive `close()` and a fresh `SpeakerBook`
+- a meeting clusters at `close()` — the same voice twice comes back as one `s1`
 - language auto-detect works (`auto-detected language: en (p = 0.977611)`)
 - Core ML fallback is real: with no `-encoder.mlmodelc` present, whisper logs
   `failed to load Core ML model` and continues on CPU

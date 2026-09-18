@@ -1,27 +1,26 @@
 import FluidAudio
 import Foundation
 
-/// Who is talking on the `system` stream, and whether we heard them before — including
-/// on an earlier day.
+/// Turns a segment of speech into a 256-d voiceprint. Nothing more — no gallery, no
+/// matching, no identity.
 ///
-/// Diarization proper answers "where are the speaker boundaries in this recording", but
-/// `Segmenter` has already done most of that: it cuts on 700 ms of silence, and a
-/// conversational turn usually ends with a pause, so an emitted segment is normally one
-/// person. That reduces the job to: embed the segment as a single speaker, then match the
-/// vector against a gallery. Two people inside one segment are not split — see SPEC.md
-/// § Known limitations.
+/// Who spoke is decided once the meeting is over, by `Cluster.speakers`, from every
+/// segment at once. Deciding it here, segment by segment as they arrive, was the old
+/// design and the reason speaker labels were unusable: each 10-second window was matched
+/// against a gallery of voiceprints accumulated across weeks, and a window is far too
+/// little evidence for that comparison. Across 23 meetings it minted 139 speakers, 41% of
+/// which spoke exactly one line; the gallery reached 67 entries whose median
+/// nearest-neighbour distance was 0.354 against a 0.35 cutoff, at which point it could no
+/// longer separate anybody from anybody.
 ///
-/// The gallery is what makes the labels survive a restart. Diarizers hand out
-/// session-local ids that are renumbered every run; a 256-d embedding on disk is the only
-/// thing that carries identity from Monday to Tuesday.
+/// Within one meeting the same embeddings work well, because the room, the microphone and
+/// the codec are held constant and every speaker is judged on all of their audio rather
+/// than one window of it. So the model stays and the gallery goes.
 ///
-/// Not thread-safe: `SpeakerManager` is a struct mutated in place. `Transcriber` owns the
-/// only reference and touches it solely from its serial queue.
-final class SpeakerBook {
+/// Not thread-safe. `Transcriber` owns the only reference and touches it solely from its
+/// serial queue.
+final class VoicePrints {
     private let diarizer = DiarizerManager()
-    private let url: URL
-    private var lastSave = Date.distantPast
-    private let drift: Float
 
     /// wespeaker's window, and a hard cap rather than a preference: the extractor copies
     /// the whole input into a `[3, 160000]` batch buffer without clamping, so a longer
@@ -29,15 +28,7 @@ final class SpeakerBook {
     /// trimming loses nothing a longer clip would have contributed anyway.
     private static let window = 160_000        // 10 s @ 16 kHz
 
-    /// EMA updates a voiceprint is allowed before it is frozen. `drift` bounds one hop;
-    /// nothing bounds the sum, and the hops compound in one direction. Measured on this
-    /// machine's gallery: 50 hops walked a centroid 0.23 from where it started, which is
-    /// most of the way to a different person. At alpha 0.9 the mean is 88% converged
-    /// after 20 hops, so the ones after that buy accuracy no longer available to buy.
-    private static let settled = 20
-
-    init?(models dir: URL, threshold: Float, drift: Float = 0.25,
-          url: URL = SpeakerBook.defaultURL) {
+    init?(models dir: URL) {
         // The segmentation model is loaded but never run: `extractSpeakerEmbedding` reads
         // the frame count (589) off its output shape to size the mask. Hardcoding that
         // number would save 6 MB and break silently the day the model changes.
@@ -46,116 +37,156 @@ final class SpeakerBook {
             localEmbeddingModel: dir.appendingPathComponent("wespeaker_v2.mlmodelc"))
         else { return nil }
         diarizer.initialize(models: m)
-
-        // FluidAudio derives its thresholds from a clustering config this path never uses.
-        // Ours comes from config.json: the right cutoff depends on the room and on what
-        // the conferencing codec did to the voice, exactly like the RMS gate.
-        //
-        // `drift` is the one that keeps a gallery honest. Every match under it EMA-blends
-        // the segment into the stored voiceprint, so leaving it at FluidAudio's 0.45 lets
-        // the centroid wander toward whoever is talking now — it ends up the mean voice in
-        // the room, within `threshold` of everybody, and no second speaker is ever minted.
-        diarizer.speakerManager = SpeakerManager(
-            speakerThreshold: threshold, embeddingThreshold: drift)
-
-        self.drift = drift
-        self.url = url
-        load()
     }
 
-    static var defaultURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/speakers.json")
-    }
-
-    /// Identify one segment. Returns the gallery id of the voice and the cosine distance
-    /// to it — `.infinity` when it matched nobody and started a new entry.
+    /// `nil` when the extractor refuses the clip — too short to embed at all.
     ///
-    /// An id, never a name: a voiceprint cluster is not a person. The same cluster is a
-    /// different human in a different room, so the name belongs to the transcript and is
-    /// resolved at read time by `TranscriptNames`.
-    ///
-    /// `nil` means the segment was too short to identify *and* too short to enroll, which
-    /// is `minSpeechDuration` doing its job: a sub-second grunt makes a bad centroid, and
-    /// a bad centroid poisons every match after it.
-    func label(_ samples: [Float]) -> (id: String, dist: Float)? {
+    /// Normalised before it is handed back. The extractor does *not* return unit vectors —
+    /// a raw pair can have a dot product above 1, which reads as a negative cosine
+    /// distance — and FluidAudio normalised them on the way into its gallery, which is why
+    /// nothing noticed while the gallery was doing the comparing.
+    func embed(_ samples: [Float]) -> [Float]? {
         let clip = samples.count > Self.window ? Array(samples[0..<Self.window]) : samples
-        guard let embedding = try? diarizer.extractSpeakerEmbedding(from: clip) else { return nil }
-
-        let match = diarizer.speakerManager.findSpeaker(with: embedding)
-
-        // Freeze the voiceprint once it is built from enough speech, by denying this one
-        // assignment the right to move it. A centroid that keeps chasing the room becomes
-        // the average voice in it and then matches everybody — the failure `drift` was
-        // meant to stop, and only slows, because it caps each hop and not the walk.
-        let updates = match.id.flatMap {
-            diarizer.speakerManager.getSpeaker(for: $0)?.updateCount
-        } ?? 0
-        diarizer.speakerManager.embeddingThreshold = updates >= Self.settled ? 0 : drift
-
-        let dist = match.distance
-        let before = diarizer.speakerManager.speakerCount
-        guard let speaker = diarizer.speakerManager.assignSpeaker(
-            embedding, speechDuration: Float(samples.count) / 16000)
-        else { return nil }
-
-        // A brand new speaker is worth a disk write on the spot. The drifted centroids
-        // are not, but a file that never moves for hours reads as a broken feature — so
-        // they go out on a minute's timer.
-        if diarizer.speakerManager.speakerCount != before
-            || Date().timeIntervalSince(lastSave) > 60 { save() }
-
-        return (speaker.id, dist)
+        guard let raw = try? diarizer.extractSpeakerEmbedding(from: clip) else { return nil }
+        let norm = raw.reduce(0) { $0 + $1 * $1 }.squareRoot()
+        return norm > 0 ? raw.map { $0 / norm } : nil
     }
-
-    // MARK: - gallery
-
-    // Nothing here re-reads the names off disk first, because nothing on this file is
-    // hand-edited any more: names live per-transcript in `TranscriptNames`, and the only
-    // field the gallery owns is the voiceprint this write exists to flush.
-    private func save() {
-        SpeakerNames.write(diarizer.speakerManager.getSpeakerList(), to: url)
-        lastSave = Date()
-    }
-
-    private func load() {
-        let known = SpeakerNames.load(from: url)
-        guard !known.isEmpty else { return }
-        diarizer.speakerManager.initializeKnownSpeakers(known, mode: .reset)
-    }
-
-    /// Flush the drifted centroids. Called once, from `Transcriber.close`.
-    func close() { save() }
 }
 
-// MARK: - naming
+// MARK: - voiceprints on disk
 
-/// Write JSON at `0600`, atomically. Same permissions as the transcripts: a voiceprint
-/// database and a list of who was in the room are equally nobody else's business.
-private func writeJSON<T: Encodable>(_ value: T, to url: URL) {
-    guard let data = try? JSONEncoder().encode(value) else { return }
-    try? data.write(to: url, options: .atomic)   // a rename, so permissions come after
-    try? FileManager.default.setAttributes(
-        [.posixPermissions: 0o600], ofItemAtPath: url.path)
-}
-
-/// The gallery as a plain file, with no models attached: the naming window has to work
-/// while Listening is off, and loading wespeaker just to read a roster would cost 6 MB
-/// and, on a cold start, half a minute.
+/// Every segment's voiceprint for one meeting, as a flat wall of `Float32`, in the order
+/// the segments were written. A transcript line carries its index in `seg`.
 ///
-/// No `save` here. The `name` field on a `Speaker` is FluidAudio's, is always `Speaker N`,
-/// and nothing reads it: names live on the transcript lines themselves.
-enum SpeakerNames {
-    static func load(from url: URL = SpeakerBook.defaultURL) -> [Speaker] {
-        guard let data = try? Data(contentsOf: url),
-              let list = try? JSONDecoder().decode([Speaker].self, from: data)
-        else { return [] }
-        return list.sorted { $0.createdAt < $1.createdAt }   // enrolment order, like user-N
+/// Beside the transcript rather than in it: 256 floats is 3 KB of JSON per line, which
+/// would grow a 100 KB transcript past 1.5 MB and make it unreadable for the humans and
+/// agents the transcript exists for. Binary, it is 1 KB a segment — 570 KB for the longest
+/// meeting here.
+///
+/// Kept after the meeting is clustered, not deleted, because every future improvement to
+/// clustering is then a re-run over old meetings instead of something that only helps from
+/// today onward. That is the whole reason this file exists.
+enum VoicePrintFile {
+    static func url(for transcript: URL) -> URL {
+        transcript.deletingPathExtension().appendingPathExtension("emb")
     }
 
-    /// This file is a voiceprint database of people who agreed to be in a meeting, not to
-    /// this. Same 0600 as the transcripts, and deleting it forgets everyone.
-    static func write(_ list: [Speaker], to url: URL) { writeJSON(list, to: url) }
+    /// Dimensions are fixed by the model. A file whose length is not a multiple of this is
+    /// truncated — a crash mid-write — and the trailing partial vector is dropped.
+    static let dims = 256
+
+    static func append(_ embedding: [Float], to url: URL) {
+        var floats = embedding
+        let data = Data(bytes: &floats, count: floats.count * MemoryLayout<Float>.size)
+        guard let h = try? FileHandle(forWritingTo: url) else {
+            // First segment of the meeting: the file does not exist yet.
+            FileManager.default.createFile(atPath: url.path, contents: data,
+                                           attributes: [.posixPermissions: 0o600])
+            return
+        }
+        h.seekToEndOfFile()
+        h.write(data)
+        try? h.synchronize()
+        try? h.close()
+    }
+
+    static func load(for transcript: URL) -> [[Float]] {
+        guard let data = try? Data(contentsOf: url(for: transcript)) else { return [] }
+        let stride = dims * MemoryLayout<Float>.size
+        return (0..<(data.count / stride)).map { i in
+            data.subdata(in: i * stride..<(i + 1) * stride).withUnsafeBytes {
+                Array($0.bindMemory(to: Float.self))
+            }
+        }
+    }
 }
+
+// MARK: - clustering
+
+/// Who spoke in one meeting, worked out from all of its voiceprints at once.
+///
+/// Agglomerative with average linkage: start with every segment its own cluster, repeatedly
+/// merge the two closest, stop when the closest pair is further apart than `threshold`.
+/// Average linkage rather than nearest-neighbour because single linkage chains — one
+/// borderline segment between two people welds both into a single cluster, which is the
+/// failure that loses a transcript.
+///
+/// The number of speakers is not asked for and not guessed; the threshold decides it.
+enum Cluster {
+    /// Cosine distance. `VoicePrints.embed` already normalises, so the division is
+    /// usually by one — it is here because assuming it silently produced a *negative*
+    /// distance on raw extractor output, and this is called a few hundred times per
+    /// meeting, not in a hot loop.
+    static func distance(_ a: [Float], _ b: [Float]) -> Float {
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for (x, y) in zip(a, b) { dot += x * y; na += x * x; nb += y * y }
+        guard na > 0, nb > 0 else { return 1 }
+        return 1 - dot / (na * nb).squareRoot()
+    }
+
+    /// Cluster index per input segment. `nil` for a segment that carries no voiceprint.
+    ///
+    /// `durations` are per segment, and a cluster holding less speech than `minSeconds` is
+    /// dropped — returned as `nil` — because it is a cough or a "yeah" rather than a
+    /// person. Clusters come back ordered by how much was said, so speaker 0 is whoever
+    /// talked most.
+    static func speakers(_ prints: [[Float]?], durations: [Double],
+                         threshold: Float, minSeconds: Double) -> [Int?] {
+        // Only segments with a voiceprint take part; the rest keep a nil slot.
+        let live = prints.indices.filter { prints[$0] != nil }
+        guard !live.isEmpty else { return prints.map { _ in nil } }
+
+        var members: [[Int]] = live.map { [$0] }        // cluster -> segment indices
+
+        // Average linkage over the *segment* pairs, kept as a running sum so a merge is an
+        // addition rather than a re-scan of both clusters.
+        var sums: [[Float]] = members.indices.map { i in
+            members.indices.map { j in
+                i == j ? 0 : distance(prints[members[i][0]]!, prints[members[j][0]]!)
+            }
+        }
+        // An array and not a `Set`: this scan is the hot part — O(clusters²) per merge and
+        // one merge per segment — and iterating a Set costs several times what iterating
+        // contiguous Ints does. A long meeting is a few hundred segments.
+        var alive = Array(members.indices)
+
+        while alive.count > 1 {
+            var best = (d: Float.infinity, a: 0, b: 0)
+            for x in 0..<alive.count {
+                let i = alive[x]
+                for y in (x + 1)..<alive.count {
+                    let j = alive[y]
+                    let d = sums[i][j] / Float(members[i].count * members[j].count)
+                    if d < best.d { best = (d, x, y) }
+                }
+            }
+            guard best.d <= threshold else { break }
+
+            let a = alive[best.a], b = alive[best.b]
+            // Merge b into a, and fold b's summed distances into a's.
+            for k in alive where k != a && k != b {
+                sums[a][k] += sums[b][k]
+                sums[k][a] = sums[a][k]
+            }
+            members[a] += members[b]
+            members[b] = []
+            alive.remove(at: best.b)
+        }
+
+        // Rank by speech, drop the ones too small to be a person.
+        let ranked = alive.map { c in (c, members[c].reduce(0.0) { $0 + durations[$1] }) }
+            .filter { $0.1 >= minSeconds }
+            .sorted { $0.1 > $1.1 }
+
+        var out = [Int?](repeating: nil, count: prints.count)
+        for (rank, entry) in ranked.enumerated() {
+            for segment in members[entry.0] { out[segment] = rank }
+        }
+        return out
+    }
+}
+
+// MARK: - the transcript
 
 /// One line of a transcript, as it is on disk. The writer, the reader and the namer share
 /// it so the schema exists once. `JSONEncoder` does not emit keys in declaration order, so
@@ -167,15 +198,85 @@ enum SpeakerNames {
 struct TranscriptLine: Codable {
     let ts: String
     let source: String?
-    /// `me`, `user-N`, or `unknown`. A cluster id, never a person.
-    let speaker: String
-    let dist: Double?
+    /// `me` for your microphone, `unknown` until the meeting is clustered or when the
+    /// segment was too little speech to place, and otherwise `s1`, `s2`, … — whoever
+    /// talked most is `s1`. Meeting-local by construction: `s1` here and `s1` in another
+    /// transcript are not a claim about the same person.
+    var speaker: String
     let dur: Double?
     let lang: String?
     let text: String
+    /// Index of this segment's voiceprint in the `.emb` file beside the transcript. Carried
+    /// on the line rather than implied by position so that re-clustering a meeting years
+    /// from now cannot mis-align, whatever happened to the file in between.
+    let seg: Int?
     /// Who `speaker` turned out to be *in this meeting*, filled in afterwards by the naming
     /// window. Absent until somebody says.
     var name: String?
+}
+
+/// Assigning `speaker` from the meeting's own clustering, once the file is closed.
+///
+/// Separate from `TranscriptNames` only because one is the machine's opinion and the other
+/// is yours; they are the same whole-file rewrite, and both are safe for the same reason —
+/// nothing appends to a transcript that has left `Transcriber.defaultLiveDir`.
+enum TranscriptSpeakers {
+    /// Cluster every voiceprint of `transcript` and write the result onto its lines.
+    ///
+    /// Called when a meeting ends, and again for anything a crash stranded. Needs no model:
+    /// the voiceprints are already on disk and cosine is arithmetic, so this runs on a
+    /// launch that never loads whisper.
+    static func assign(_ transcript: URL, threshold: Float, minSeconds: Double) {
+        let prints = VoicePrintFile.load(for: transcript)
+        let lines = TranscriptSnippets.decode(transcript)
+        guard !prints.isEmpty, !lines.isEmpty else { return }
+
+        // Indexed by `seg`, so a line the decoder could not read costs only itself.
+        var byLine: [[Float]?] = [], durations: [Double] = []
+        for line in lines {
+            let print = line?.seg.flatMap { prints.indices.contains($0) ? prints[$0] : nil }
+            byLine.append(print)
+            durations.append(line?.dur ?? 0)
+        }
+
+        let clusters = Cluster.speakers(byLine, durations: durations,
+                                        threshold: threshold, minSeconds: minSeconds)
+        var speakers: [Int: String] = [:]
+        for (i, cluster) in clusters.enumerated() where byLine[i] != nil {
+            speakers[i] = cluster.map { "s\($0 + 1)" } ?? "unknown"
+        }
+        rewrite(transcript) { i, line in
+            guard let speaker = speakers[i] else { return line }
+            var line = line
+            line.speaker = speaker
+            return line
+        }
+    }
+
+    /// Rewrite every line of a transcript through `edit`, atomically, keeping a line the
+    /// decoder cannot read byte for byte. The one operation that touches a transcript, so
+    /// the guarantee lives in one place.
+    static func rewrite(_ transcript: URL,
+                        _ edit: (Int, TranscriptLine) -> TranscriptLine) {
+        guard let body = try? String(contentsOf: transcript, encoding: .utf8) else { return }
+        let decoder = JSONDecoder(), encoder = JSONEncoder()
+
+        // `omittingEmptySubsequences: false` keeps the empty piece after the final newline,
+        // so joining restores it and the file stays appendable-looking.
+        let out = body.split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated().map { i, raw -> String in
+                guard let line = try? decoder.decode(TranscriptLine.self, from: Data(raw.utf8)),
+                      let data = try? encoder.encode(edit(i, line)),
+                      let text = String(data: data, encoding: .utf8)
+                else { return String(raw) }
+                return text
+            }.joined(separator: "\n")
+
+        guard let data = out.data(using: .utf8) else { return }
+        try? data.write(to: transcript, options: .atomic)   // a rename, permissions after
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: transcript.path)
+    }
 }
 
 /// Who each voice was in one meeting, written onto the meeting's own lines.
@@ -205,33 +306,16 @@ enum TranscriptNames {
     /// Put `names` on every line they apply to. A blank name removes it; a voice that is
     /// not mentioned is left alone.
     ///
-    /// Whole-file rewrite, atomically — 13 ms on the largest transcript here, which is why
-    /// the window writes on commit and not on every keystroke.
+    /// Whole-file rewrite — 13 ms on the largest transcript here, which is why the window
+    /// writes on commit and not on every keystroke.
     static func apply(_ names: [String: String], to transcript: URL) {
-        guard let body = try? String(contentsOf: transcript, encoding: .utf8) else { return }
-        let decoder = JSONDecoder(), encoder = JSONEncoder()
-
-        // `omittingEmptySubsequences: false` keeps the empty piece after the final newline,
-        // so joining restores it and the file stays appendable-looking.
-        let rewritten = body.split(separator: "\n", omittingEmptySubsequences: false).map {
-            raw -> String in
-            // A line this cannot read — the tail a crash left half-written — goes back
-            // byte for byte. Rewriting a transcript must never cost it a line.
-            guard var line = try? decoder.decode(TranscriptLine.self, from: Data(raw.utf8)),
-                  let typed = names[line.speaker]
-            else { return String(raw) }
+        TranscriptSpeakers.rewrite(transcript) { _, line in
+            guard let typed = names[line.speaker] else { return line }
+            var line = line
             let name = typed.trimmingCharacters(in: .whitespacesAndNewlines)
             line.name = name.isEmpty ? nil : name
-            guard let data = try? encoder.encode(line),
-                  let text = String(data: data, encoding: .utf8)
-            else { return String(raw) }
-            return text
-        }.joined(separator: "\n")
-
-        guard let data = rewritten.data(using: .utf8) else { return }
-        try? data.write(to: transcript, options: .atomic)   // a rename, so permissions come after
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: transcript.path)
+            return line
+        }
     }
 
     /// Names used to live in a `<stamp>.names.json` beside the transcript. Fold any that

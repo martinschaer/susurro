@@ -8,8 +8,16 @@ posts.
 original reasoning and the reversal are both kept below, since the *reason* B was
 recommended was a toolchain accident, not a technical judgement about the libraries.
 
-> **Status: steps 0, 1 and 2 are implemented** on option C — see SPEC.md § Speakers.
-> `speaker` and `dist` are in the JSONL, the gallery lives at `~/.susurro/speakers.json`,
+> **Superseded, kept as the record of how the choice was made.** FluidAudio was the right
+> pick and is still in use, but the way this document proposed to use it — cosine-matching
+> each segment against a persistent cross-day gallery as it arrives — failed in practice.
+> After a few months it had minted 139 speakers across 23 meetings, 41% of which spoke
+> exactly one line, and the gallery's median nearest-neighbour distance had reached 0.354
+> against a 0.35 cutoff. Speakers are now clustered per meeting once it ends, with no
+> cross-day identity at all; see SPEC.md § Speakers. What follows is unedited.
+>
+> `speaker` is in the JSONL, the voiceprints live beside each transcript,
+
 > naming is the *Name speakers…* window (or hand-editing `name`, same file), and
 > `make smoke` covers minting, matching, reload, discrimination, and renaming. Step 3
 > (splitting a segment) is not built.

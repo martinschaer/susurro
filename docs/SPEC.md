@@ -26,7 +26,7 @@ tests beyond one smoke check.
 | Model | `ggml-large-v3-turbo` + prebuilt Core ML encoder | Multilingual (ES/EN mixing), fast on M-series |
 | VAD | whisper.cpp built-in Silero v5.1.2 | Kills whisper's silence hallucinations |
 | Speakers | FluidAudio (pyannote community-1 + WeSpeaker) via Core ML | 256-d embeddings on the ANE; matching layer already tuned |
-| Speaker identity | Cosine match against `~/.susurro/speakers.json` | Diarizers renumber every run; only a persisted embedding survives the night |
+| Speaker identity | Per meeting, clustered when it ends | A window matched against a weeks-old gallery is the hardest form of the question on the least evidence; within one meeting the room and codec are constant |
 | Speaker names | On the transcript's own lines, per transcript | A `user-N` is a voiceprint cluster, not a person: across days clusters merge people, so one global name is wrong somewhere |
 | Live transcript | Written in `~/.susurro/live`, moved out when the meeting ends | Naming rewrites the whole file; the engine holds an open handle at a cached offset, so the file it is appending to must be somewhere nothing else touches |
 | Storage | `~/.susurro/transcripts/YYYY-MM-DD_HH-MM-SS.jsonl` | Append-only, greppable, one file per meeting |
@@ -78,8 +78,8 @@ Core Audio tap     ───┘   16 kHz mono f32      └── stream "system"
                                         │
                           ┌─────────────┴──── source == "system"
                           │                            │
-                          │                   SpeakerBook (embed + match)
-                          │                   ~/.susurro/speakers.json
+                          │                   VoicePrints (embed only)
+                          │                   <meeting>.emb, clustered at close
                           ▼                            │
                           └────────────┬───────────────┘
                                        ▼
@@ -90,7 +90,7 @@ Two independent capture sources, one shared transcriber. A single `whisper_conte
 not reentrant, so both streams funnel through one serial `DispatchQueue`. Segments are
 seconds long; queueing is fine and halves resident memory vs. two contexts.
 
-`SpeakerBook` hangs off the same queue, which is also what makes it thread-safe —
+`VoicePrints` hangs off the same queue, which is also what makes it thread-safe —
 `SpeakerManager` is a struct mutated in place, with no lock anywhere.
 
 ### Capture
@@ -165,61 +165,76 @@ poisons every subsequent one in an always-on run.
 ### Speakers
 
 `Segmenter` cuts on 700 ms of silence, and a conversational turn normally ends with a
-pause — so an emitted segment is usually one person. That removes the expensive half of
-diarization: embed the whole segment as a single speaker, no segmentation pass, no
-clustering. `DiarizerManager.extractSpeakerEmbedding` does exactly this, feeding an
-all-ones frame mask to WeSpeaker and returning a 256-d L2-normalized vector.
+pause — so an emitted segment is usually one person. `DiarizerManager.extractSpeakerEmbedding`
+turns each one into a 256-d WeSpeaker vector, feeding an all-ones frame mask, and that is
+all that happens while the meeting is running. The vector is appended to a `.emb` file and
+the line is written `speaker:"unknown"`.
 
-`SpeakerManager` then cosine-matches it against the gallery, mints `user-N` on a miss, and
-refines the matched centroid by EMA. Defaults worth knowing:
+**Who spoke is decided when the meeting ends, from every segment at once.** That is the
+whole design, and it is the opposite of what this did before.
+
+The previous version answered the question per segment, as each arrived, by cosine-matching
+one 10-second window against a gallery of voiceprints accumulated across weeks. Measured on
+this machine after a few months: 139 speakers minted across 23 meetings, **41% of which
+spoke exactly one line**, those lines running to a median of 2.4 s against 10.1 s for
+voices that spoke more than once. One 56-line meeting held 17 distinct "speakers". The
+gallery reached 67 entries whose median nearest-neighbour distance was **0.354** against a
+0.35 cutoff — at which point it could no longer separate anybody from anybody, and no
+threshold value would have fixed it.
+
+Three things were wrong and each made the others worse: identity was decided per segment,
+on the least evidence available; it was decided at write time, irreversibly, before the
+rest of the meeting existed; and it was decided against a cross-day gallery, which is the
+hardest form of the comparison. Within one meeting the same embeddings work well — the
+room, the microphone and the codec are held constant, and each speaker is judged on all of
+their audio. On 187 real segment embeddings from this machine, within-speaker pairs run to
+a median of 0.235 and between-speaker pairs to 0.558.
+
+So `Cluster.speakers` runs at `publish`: agglomerative, average linkage, cosine, merging
+the closest pair until nothing is within `clusterThreshold`. The number of speakers is
+never asked for or guessed — the threshold decides it. Clusters are ranked by how much was
+said, so `s1` is whoever talked most, and a cluster holding less than `minSpeakerSec` of
+speech is `unknown` rather than a person: a cough, a "yeah", crosstalk. **The labels are
+meeting-local.** `s1` here and `s1` in another transcript are not a claim about the same
+person, and nothing persists between meetings.
+
+Average linkage, not single. Single linkage chains: one borderline segment sitting between
+two people merges with the first, then reports its own small distance to the second and
+welds all three into one speaker. Nothing recovers a transcript that filed two people as
+one, whereas naming both halves of a split the same thing reads correctly.
 
 ```
-speakerThreshold           = 0.35      // config.json; <0.3 is a confident match
-embeddingThreshold         = 0.25      // config.json; above this a match does not
-                                       //   refine the centroid, only its duration
-settled                    = 20        // EMA updates, then the voiceprint is frozen
-minSpeechDuration          = 1.0 s     // below this: match, never enroll
-minEmbeddingUpdateDuration = 2.0 s     // below this: match, never update the centroid
+clusterThreshold = 0.40     // config.json; max average cosine distance to merge
+minSpeakerSec    = 3.0      // config.json; below this a cluster is `unknown`
 ```
 
-Those two floors are the guard against gallery rot. A sub-second grunt makes a bad
-centroid, and a bad centroid mismatches everything after it.
+`clusterThreshold` is measured rather than taken from the library's suggestion. Clustering
+the five most-spoken voices, 20 segments each, recovers all five cleanly at 0.35 and 0.40,
+collapses them to three at 0.45 and to one at 0.55. FluidAudio suggests 0.6–0.8 for a
+single recording; on these embeddings 0.6 merges everybody. The grouping those segments
+came from was itself made at 0.35, so "recovers all five" is partly circular — the collapse
+above 0.45 is not, and that is what fixes the ceiling. Raise it if one person splits in
+two; lower it if two people merge.
 
-`embeddingThreshold` is the guard against the slower rot, and FluidAudio's 0.45 default is
-wrong for a gallery that lives for weeks. Every match under it EMA-blends the segment into
-the stored voiceprint at `alpha: 0.9`. Measured p50 distance on real calls is 0.23, so at
-0.45 nearly every segment rewrites the centroid: it walks toward whoever is speaking now,
-converges on the average voice in the room, and from then on sits within `speakerThreshold`
-of everybody — so `assignSpeaker` never takes the create branch again. Five days of real
-meetings produced two entries whose own stored exemplars were further apart (p50 0.449)
-than the two entries were from each other (0.423). Offline clustering of those same
-exemplars finds six to eleven voices. Keep the blend rare and the voiceprint stays the
-person who enrolled it.
+Cost is 128 ms for a 600-segment meeting, once, at close.
 
-`embeddingThreshold` caps one hop, and nothing caps their sum — which is the rot it does
-*not* stop. The hops compound in one direction, so a voiceprint keeps sliding at 0.25 the
-way it sprinted at 0.45, just slower. Measured on a real gallery: 50 hops moved a centroid
-0.23 from where it started, and one entry's own exemplars ran from 0.09 to 0.43 of its
-first — a step, dated a week later, where a second person arrived and was absorbed. So a
-voiceprint is frozen after `settled` updates. At `alpha: 0.9` the mean is 88% converged by
-then; every hop after that is chasing the room, not learning the person.
-
-`speakerThreshold` was 0.45, and that was too loose. Scoring a real gallery — same-speaker
-exemplar pairs against different-speaker pairs — the two distributions separate cleanly,
-same-speaker at p95 0.33 and different-speaker at p05 0.41. 0.45 sits inside the
-different-speaker distribution: about 10% of pairs drawn from two different people fall
-under it, which is how strangers end up sharing a `user-N`. 0.35 sits in the gap.
+`extractSpeakerEmbedding` does **not** return unit vectors, whatever the library's
+clustering does with them afterwards; a raw pair can have a dot product above 1, which
+reads as a negative cosine distance. `VoicePrints.embed` normalises before anything stores
+or compares them.
 
 **Clips are hard-capped at 10 s** before they reach the extractor. That is not a
 preference: the extractor copies its input into a `[3, 160000]` batch buffer with no
 clamp, so a longer clip writes over the neighbouring batch slots. Only slot 0 is read
 back, so trimming loses nothing.
 
-The gallery is written on new-speaker creation and on `close()` — never per segment.
-Losing a little centroid drift to a crash is cheap; losing a speaker is not.
+Missing speaker models degrade to `speaker:"unknown"` throughout and a menu-bar note. They
+never cost you the transcript.
 
-Missing speaker models degrade to `speaker:"unknown"` and a menu-bar note. They never cost
-you the transcript.
+There is no cross-day speaker identity, by design. Recognising a voice from a previous
+meeting is a *suggestion* problem, and the material for it now exists in a far better
+form — a centroid built from everything one person said in a meeting, rather than one
+window against a drifted mean — but it must never write a label.
 
 ### Storage
 
@@ -240,7 +255,7 @@ appears in, which is the thing that is wrong. The name for this meeting goes in 
 field, added afterwards by the naming window:
 
 ```json
-{"ts":"…","source":"system","speaker":"user-2","name":"Ana","dist":0.31,"dur":3.42,"lang":"es","text":"…"}
+{"ts":"…","source":"system","speaker":"s2","name":"Ana","dur":3.42,"lang":"es","seg":41,"text":"…"}
 ```
 
 `name` is absent until somebody says. In the line and not in a sidecar so the transcript is
@@ -264,10 +279,15 @@ largest transcript here — which is why the window writes on commit rather than
 keystroke. `JSONEncoder` does not emit keys in declaration order, so a rewritten line is
 reordered; same object, different byte layout.
 
-`dist` is the cosine distance to the matched speaker, and it is written **so that a bad
-day is re-clusterable offline** rather than baked into the transcript. It is absent when
-nothing matched, which is also a hard requirement: a miss reports `.infinity`, and
-`JSONEncoder` throws on non-finite doubles, which would silently drop the line.
+`seg` is the index of this segment's voiceprint in the `.emb` file beside the transcript —
+a flat wall of `Float32`, 256 per segment. On the line rather than implied by position, so
+that re-clustering years later cannot mis-align whatever happened to the file in between.
+
+The voiceprints are kept after the meeting is clustered, not deleted. That is what makes
+every future improvement to clustering a re-run over old meetings instead of something that
+only helps from today onward — the thing the old `dist` field claimed to enable and could
+not, because a distance is not a vector. At 1 KB a segment it is 570 KB for the longest
+meeting here; as JSON on the line it would have grown a 100 KB transcript past 1.5 MB.
 
 Directory created `0700` at launch. Empty-text results are not written.
 
@@ -335,18 +355,16 @@ Bluetooth headset have different noise floors, and no fixed constant is right fo
 three. Expose it as `~/.susurro/config.json`:
 
 ```json
-{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "speakerThreshold": 0.35,
- "embeddingThreshold": 0.25, "sessionGapMin": 5}
+{"rmsThreshold": 0.01, "silenceMs": 700, "maxSegmentSec": 25, "clusterThreshold": 0.4,
+ "minSpeakerSec": 3, "sessionGapMin": 5}
 ```
 
-`speakerThreshold` is calibration for the same reason: what a conferencing codec does to a
-voice varies by platform. FluidAudio suggests 0.6–0.8, but that is tuned for clustering one
-recording; a gallery that has to still be right next month wants tighter. Raise it if one
-person keeps splitting into two `user-N`; lower it if two people keep merging. Splitting is
-the better failure — type the same name into both entries and they read as one person,
-whereas nothing recovers a transcript that filed two people under one.
+`clusterThreshold` is calibration for the same reason: what a conferencing codec does to a
+voice varies by platform, and the right cutoff depends on the room. The measurement behind
+the 0.40 default, and how to move it, is in § Speakers.
 
-`embeddingThreshold` should stay well under it, for the reason above.
+`minSpeakerSec` is the floor under which a cluster is noise rather than a person. Lower it
+if someone who genuinely only said one sentence keeps coming back `unknown`.
 
 `sessionGapMin` is where a transcript file ends: minutes of silence on both streams before
 the next line goes to a new file. Too low and one meeting with a long lull becomes two
@@ -391,9 +409,8 @@ the same person's previous segment rather than somebody else's turn.
 Hand-editing a `name` field is the same operation and still works — the window is only a
 read-modify-write of that file, which is why it needs no models loaded and works with
 Listening off. Reading the lines is the same trick applied to the transcripts: a directory
-scan and a JSONL decode, no whisper context. Nothing here touches `speakers.json`: the
-gallery owns the voiceprint, the sidecar owns the name, and the two never write to each
-other. The transcripts are append-only; nothing rewrites a label that is already on disk.
+scan and a JSONL decode, no whisper context. The transcripts are append-only once
+published; nothing rewrites a label that is already on disk.
 
 ## Known limitations
 
@@ -417,16 +434,19 @@ Accepted for a prototype, listed so they are not rediscovered as bugs:
    nearest. The RMS gate cuts on silence, and interruptions do not have any. The fix is to
    run `pyannote_segmentation` on the segment and split it, roughly doubling the pipeline;
    gate that on evidence from real transcripts, not on principle.
-8. **Cross-day identity degrades.** Same call, same day is the easy case. Across days,
-   low-bitrate Opus, noise suppression and AGC distort exactly the spectral detail the
-   embedding keys on — the same person on Zoom vs. in the room can land further apart than
-   two different people on one platform. Expect it to hold for 5–10 recurring colleagues
-   and to start false-merging as strangers accumulate, since each false merge poisons a
-   centroid and causes the next. `dist` in the JSONL is there so a bad stretch can be
-   re-clustered offline.
-9. **`speakers.json` is a voiceprint database** of people who agreed to be in a meeting,
-   not to this. It lives at `0700`/`0600` beside the transcripts, and deleting the file
-   forgets everyone.
+8. **No cross-day identity at all.** A voice recognised in Tuesday's meeting is not
+   recognised in Friday's; `s1` in one transcript says nothing about `s1` in another. This
+   is deliberate — the previous attempt at it is what made speaker labels unusable — but it
+   means naming is per meeting, every meeting, with only the suggestions to help. Matching
+   a meeting's clusters against previously named ones is the obvious next feature and has
+   not been built.
+9. **A meeting is only as good as its clustering**, and the clustering is not shown to you.
+   If `clusterThreshold` is wrong for your room you get two `s` numbers for one person, or
+   worse, one for two. The lines are there to read, and re-running the clustering over the
+   kept `.emb` file is cheap, but nothing in the UI does it yet.
+10. **The voiceprints are a biometric.** `<meeting>.emb` is a set of speaker embeddings for
+   people who agreed to be in a meeting, not to this. They live at `0700`/`0600` beside the
+   transcripts, and deleting them loses the ability to re-cluster, nothing else.
 
 ## Verification
 
@@ -435,11 +455,21 @@ One check, `make smoke`: feed `samples/jfk.wav` (ships with whisper.cpp) through
 that a synthetic tone-silence-tone buffer produces exactly 2 segments. Fails loudly if
 either the model wiring or the gate logic breaks. No framework, no fixtures.
 
-The same audio also goes down the `system` stream twice, asserting `me` / `user-1` /
-`user-1` — minting and matching are different branches — that the gallery survives a
-reopen, and that a decimated (~1.2× pitch) copy becomes `user-2`. That last one is the
-only check that catches an embedder returning a constant vector, which would collapse
-everyone into `user-1` while every other assertion still passed.
+The same audio also goes down the `system` stream twice and must come back as one speaker,
+`s1`, clustered after `close` rather than during the run — with both lines carrying a `seg`
+index and the `.emb` file travelling with the published transcript. A decimated (~1.2×
+pitch) copy must embed more than `clusterThreshold` away from the original; that is the only
+check that catches an embedder returning a constant vector, which would collapse everyone
+into one speaker while every other assertion still passed.
+
+The clustering itself is checked without models, on hand-built vectors, because cosine is
+arithmetic: segments of one voice land in one cluster, whoever talked most is `s1`, a
+two-second cluster is dropped as noise, a segment with no voiceprint keeps its slot, and a
+borderline segment between two people does **not** chain them into one — the assertion that
+fails if average linkage is ever swapped for single. Then end to end, still without models:
+a hand-written `.emb` plus a transcript whose `seg` indices skip a mic line in the middle,
+asserting the labels land on the right lines, the mic line is untouched, and not a word of
+the text moved.
 
 The transcript-reading checks need no models at all. Three hand-written JSONL fixtures
 assert the roster (meetings newest first, `me` excluded from the voices, the sample being
@@ -460,8 +490,7 @@ voting for itself.
 
 With models loaded: an open transcript is in the live directory and nowhere else, `close`
 publishes it and only then, a file stranded in `live` is published at the next launch, and
-naming a voice then reopening the gallery still identifies it as id `1` — so no name can
-find its way back into a written line.
+a clustered meeting still names the way an unclustered one does.
 
 Both targets build with `-parse-as-library` and carry their own `@main`; `smoke.swift`
 links `Capture.swift` + `Transcriber.swift` instead of `SusurroApp.swift`. Top-level code
@@ -471,13 +500,9 @@ compiled, so `@main` is the path of least resistance for both.
 Manual acceptance: enable → say something → play a YouTube clip → confirm the newest JSONL
 has both a `mic` and a `system` line with sane text, the mic lines say `me`, and the clip's
 voices got `user-N`. Then join a call with two other people and check the two of them do
-not collapse into one `user-N` — if they do, lower `speakerThreshold`, and check
-`embeddingThreshold` is not letting the centroids wander. A gallery already collapsed
-cannot be tuned back out of it: a centroid that has become the room's average voice stays
-within any usable threshold of everybody, so delete `~/.susurro/speakers.json` and let it
-re-enrol.
+do not collapse into one `s` number — if they do, lower `clusterThreshold`, and if one of
+them splits in two, raise it. There is nothing to delete and nothing to reset: a meeting's
+clustering depends on that meeting alone, so a bad run costs you that transcript's labels
+and nothing else, and re-running it over the kept `.emb` file is cheap.
 
-That collapse is not reproducible in `smoke.swift`: it needs hundreds of genuinely
-different voices, and one `jfk.wav` pitch-shifted cannot fake them. The smoke check covers
-the knob (at 0 no match may touch a stored voiceprint, at 1 every match must); the
-behaviour itself is checked against `speakers.json` after a real call.
+The behaviour itself is checked against a real call's own transcript.

@@ -478,10 +478,11 @@ final class Engine {
         DispatchQueue.global(qos: .userInitiated).async {
             // Missing speaker models must not cost you the transcript: without them every
             // system line is simply labelled "unknown".
-            let book = SpeakerBook(models: models, threshold: cfg.speakerThreshold,
-                                   drift: cfg.embeddingThreshold)
-            let t = Transcriber(model: model, vad: vadURL, speakers: book,
-                                gapSec: cfg.sessionGapMin * 60)
+            let voices = VoicePrints(models: models)
+            let t = Transcriber(model: model, vad: vadURL, voices: voices,
+                                gapSec: cfg.sessionGapMin * 60,
+                                clusterThreshold: cfg.clusterThreshold,
+                                minSpeakerSec: cfg.minSpeakerSec)
             DispatchQueue.main.async {
                 guard gen == self.generation, self.enabled else {
                     t?.close()                // toggled off mid-load; discard it
@@ -505,7 +506,7 @@ final class Engine {
 
                 // One source failing must not take the other down.
                 var failures: [String] = []
-                if book == nil { failures.append("speaker models missing — use Download models") }
+                if voices == nil { failures.append("speaker models missing — use Download models") }
                 do { try m.start() } catch {
                     failures.append("mic: \(error.localizedDescription)")
                 }

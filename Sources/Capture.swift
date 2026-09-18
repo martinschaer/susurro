@@ -13,23 +13,33 @@ struct Config {
     var silenceMs = 700
     var maxSegmentSec = 25.0
 
-    /// Max cosine distance for two segments to count as the same person. Hardware- and
-    /// codec-dependent like `rmsThreshold`. FluidAudio suggests 0.6–0.8, tuned for one
-    /// recording; a gallery that lives for weeks needs tighter, or every voice ends up in
-    /// the first entry. Raise it if one person keeps splitting into two `user-N`.
+    /// Max average cosine distance for two groups of segments in one meeting to be the
+    /// same person.
     ///
-    /// 0.35 is measured, not guessed. Scoring this machine's own gallery — same-speaker
-    /// pairs against different-speaker pairs — puts same-speaker at p95 0.33 and
-    /// different-speaker at p05 0.41, so the two distributions have a gap and 0.35 sits
-    /// in it. The old 0.45 sat inside the different-speaker distribution: ~10% of pairs
-    /// from two different people fell under it, which is exactly the reported symptom.
-    var speakerThreshold: Float = 0.35
+    /// Measured, not taken from the library's suggestion. On 187 real segment embeddings
+    /// off this machine, within-speaker pairs run to a median of 0.235 and between-speaker
+    /// pairs to 0.558 — well separated — but the tails overlap around 0.38. Clustering the
+    /// five most-spoken voices, 20 segments each, recovers all five cleanly at 0.35 and
+    /// 0.40, collapses them to three at 0.45 and to one at 0.55. FluidAudio suggests
+    /// 0.6–0.8 for a single recording; on these embeddings 0.6 merges everybody.
+    ///
+    /// The grouping those segments came from was itself made at 0.35, so "recovers all
+    /// five" is partly circular — the collapse above 0.45 is not, and that is what fixes
+    /// the ceiling. 0.40 takes the headroom below it.
+    ///
+    /// Raise it if one person splits in two; lower it if two people merge. Splitting is the
+    /// better failure: naming both halves the same thing reads correctly, and nothing
+    /// recovers a transcript that filed two people as one.
+    var clusterThreshold: Float = 0.4
 
-    /// Max distance for a match to also drag the stored voiceprint toward it. Below
-    /// FluidAudio's 0.45 default on purpose: measured p50 distance on real calls is 0.23,
-    /// so at 0.45 nearly every segment rewrites the centroid — and a centroid that follows
-    /// the room becomes the average voice in it, which then matches everybody.
-    var embeddingThreshold: Float = 0.25
+    /// A cluster with less speech than this is not a person, it is noise — a cough, a
+    /// "yeah", crosstalk — and is labelled `unknown` rather than given a number.
+    ///
+    /// Measured: across 23 meetings, 41% of the voices the old online matcher minted spoke
+    /// exactly one line, and those lines ran to a median of 2.4 s against 10.1 s for voices
+    /// that spoke more than once. Clustering after the fact removes most of that tail on
+    /// its own; this removes the rest.
+    var minSpeakerSec: Double = 3.0
 
     /// Silence on both streams for longer than this starts a new transcript file, so one
     /// file is one meeting. Toggling Listening off/on always starts a new one too.
@@ -47,8 +57,8 @@ struct Config {
         if let v = o["rmsThreshold"] as? Double { c.rmsThreshold = Float(v) }
         if let v = o["silenceMs"] as? Int { c.silenceMs = v }
         if let v = o["maxSegmentSec"] as? Double { c.maxSegmentSec = v }
-        if let v = o["speakerThreshold"] as? Double { c.speakerThreshold = Float(v) }
-        if let v = o["embeddingThreshold"] as? Double { c.embeddingThreshold = Float(v) }
+        if let v = o["clusterThreshold"] as? Double { c.clusterThreshold = Float(v) }
+        if let v = o["minSpeakerSec"] as? Double { c.minSpeakerSec = v }
         if let v = o["sessionGapMin"] as? Double { c.sessionGapMin = v }
         return c
     }

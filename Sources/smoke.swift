@@ -72,13 +72,13 @@ enum Smoke {
         check(meetings[1].lines == 5,
               "only decodable lines are counted (got \(meetings[1].lines))")
 
-        let voices = meetings[1].voices
-        check(voices.map(\.label) == ["user-1", "user-2"],
+        let roster = meetings[1].voices
+        check(roster.map(\.label) == ["user-1", "user-2"],
               "every voice in the meeting, and `me` is not one of them "
-              + "(got \(voices.map(\.label)))")
-        check(voices[0].lines == 3, "lines per voice (got \(voices[0].lines))")
-        check(voices[0].sample.hasPrefix("the longest thing"),
-              "the sample is the longest line, not the first (got \(voices[0].sample))")
+              + "(got \(roster.map(\.label)))")
+        check(roster[0].lines == 3, "lines per voice (got \(roster[0].lines))")
+        check(roster[0].sample.hasPrefix("the longest thing"),
+              "the sample is the longest line, not the first (got \(roster[0].sample))")
 
         // MARK: one voice in one meeting — in order, with the turn either side
         let said = TranscriptSnippets.lines(for: "user-1", in: a)
@@ -172,6 +172,89 @@ enum Smoke {
 
         try? FileManager.default.removeItem(at: snips)
 
+        // MARK: clustering — who spoke, decided from the whole meeting at once
+        //
+        // No models: cosine over vectors is arithmetic. These are the checks that the old
+        // online matcher could never have passed, because it judged each segment alone.
+        func vec(_ a: Float, _ b: Float) -> [Float] {
+            var v = [Float](repeating: 0, count: 256)
+            let n = (a * a + b * b).squareRoot()      // L2-normalised, as wespeaker's are
+            v[0] = a / n; v[1] = b / n
+            return v
+        }
+        let ana = vec(1, 0), anaAgain = vec(0.99, 0.14), bruno = vec(0, 1)
+        check(Cluster.distance(ana, ana) < 0.001, "a voiceprint is zero from itself")
+        check(Cluster.distance(ana, bruno) > 0.99, "and far from an unrelated one")
+
+        // Two of Ana and one of Bruno: two speakers, and Ana is `s1` for talking most.
+        let three = Cluster.speakers([ana, anaAgain, bruno], durations: [10, 10, 10],
+                                     threshold: 0.6, minSeconds: 3)
+        check(three == [0, 0, 1],
+              "segments of one voice land in one cluster, ranked by speech (got \(three))")
+
+        // The same three with Bruno talking longest: the ranking follows the speech, not
+        // the order of arrival.
+        check(Cluster.speakers([ana, anaAgain, bruno], durations: [4, 4, 30],
+                               threshold: 0.6, minSeconds: 3) == [1, 1, 0],
+              "whoever talked most is s1")
+
+        // A two-second "yeah" is not a person. This is the 41% of voices the old matcher
+        // minted that spoke exactly one line.
+        check(Cluster.speakers([ana, anaAgain, bruno], durations: [10, 10, 2],
+                               threshold: 0.6, minSeconds: 3) == [0, 0, nil],
+              "a cluster with too little speech is dropped rather than numbered")
+
+        // Average linkage, not single. `between` is 0.29 from each of the other two, which
+        // are 1.0 from each other. Single linkage merges `between` with Ana, then sees
+        // 0.29 to Bruno — the nearest pair, ignoring how far the rest of the cluster is —
+        // and welds all three into one person. Average linkage sees (1.0 + 0.29) / 2 and
+        // stops. Chaining like this is the failure that loses a transcript, because
+        // nothing recovers two people filed as one.
+        let between = vec(0.71, 0.71)
+        let chained = Cluster.speakers([ana, between, bruno], durations: [10, 10, 10],
+                                       threshold: 0.4, minSeconds: 3)
+        check(Set(chained.compactMap { $0 }).count == 2,
+              "a borderline segment does not chain two speakers into one (got \(chained))")
+
+        check(Cluster.speakers([nil, ana], durations: [5, 5], threshold: 0.6, minSeconds: 3)
+                == [nil, 0],
+              "a segment with no voiceprint keeps its slot and no cluster")
+        check(Cluster.speakers([], durations: [], threshold: 0.6, minSeconds: 3).isEmpty,
+              "an empty meeting clusters to nothing")
+
+        // MARK: voiceprints on disk, and the labelling that reads them back
+        let clus = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("susurro-cluster-\(getpid())")
+        try FileManager.default.createDirectory(at: clus, withIntermediateDirectories: true)
+        let meet = clus.appendingPathComponent("2026-02-01_09-00-00.jsonl")
+
+        for v in [ana, anaAgain, bruno, ana] {
+            VoicePrintFile.append(v, to: VoicePrintFile.url(for: meet))
+        }
+        let readBack = VoicePrintFile.load(for: meet)
+        check(readBack.count == 4 && readBack[0].count == 256,
+              "voiceprints round-trip as a wall of floats (got \(readBack.count))")
+        check(Cluster.distance(readBack[0], ana) < 0.001, "and come back unchanged")
+
+        // `seg` is what joins a line to its voiceprint — deliberately not the line's
+        // position, so a mic line in the middle cannot shift the alignment.
+        try """
+        {"ts":"2026-02-01T09:00:00+01:00","source":"system","speaker":"unknown","dur":12,"text":"ana one","seg":0}
+        {"ts":"2026-02-01T09:00:20+01:00","source":"mic","speaker":"me","dur":5,"text":"and you"}
+        {"ts":"2026-02-01T09:00:40+01:00","source":"system","speaker":"unknown","dur":12,"text":"ana two","seg":1}
+        {"ts":"2026-02-01T09:01:00+01:00","source":"system","speaker":"unknown","dur":2,"text":"yeah","seg":2}
+        {"ts":"2026-02-01T09:01:20+01:00","source":"system","speaker":"unknown","dur":12,"text":"ana three","seg":3}
+        """.write(to: meet, atomically: true, encoding: .utf8)
+        TranscriptSpeakers.assign(meet, threshold: 0.6, minSeconds: 3)
+
+        let labelled = TranscriptSnippets.decode(meet).compactMap { $0 }
+        check(labelled.map(\.speaker) == ["s1", "me", "s1", "unknown", "s1"],
+              "the meeting is labelled from its own voiceprints, mic untouched, the "
+              + "two-second segment left unknown (got \(labelled.map(\.speaker)))")
+        check(labelled.map(\.text) == ["ana one", "and you", "ana two", "yeah", "ana three"],
+              "and not a word of it moved")
+        try? FileManager.default.removeItem(at: clus)
+
         // MARK: Transcriber — jfk.wav all the way to JSONL on disk
         let model = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models/ggml-tiny.bin")
         guard FileManager.default.fileExists(atPath: model.path) else {
@@ -185,15 +268,14 @@ enum Smoke {
         // Its own live directory, emphatically. The default is `~/.susurro/live`, and
         // `publishStragglers` would move a real stranded meeting into this temp dir.
         let hot = out.appendingPathComponent("live")
-        let gallery = out.appendingPathComponent("speakers.json")
         let models = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/models")
 
         // No speaker models is a skip, not a failure — the app degrades the same way,
         // labelling every system line "unknown" rather than losing the transcript.
-        let book = SpeakerBook(models: models, threshold: 0.65, url: gallery)
-        if book == nil { print("  SKIP  speaker labels (no speaker models — run ./setup.sh)") }
+        let voices = VoicePrints(models: models)
+        if voices == nil { print("  SKIP  speaker labels (no speaker models — run ./setup.sh)") }
 
-        guard let t = Transcriber(model: model, vad: nil, speakers: book, dir: out,
+        guard let t = Transcriber(model: model, vad: nil, voices: voices, dir: out,
                                   liveDir: hot) else {
             print("  FAIL  model load"); exit(1)
         }
@@ -254,102 +336,43 @@ enum Smoke {
 
         check(obj["speaker"] as? String == "me", "mic line is 'me'")
         // .infinity here would have thrown inside JSONEncoder and dropped the whole line.
-        check(obj["dist"] == nil, "mic line carries no distance")
+        check(obj["seg"] == nil, "mic line carries no voiceprint")
 
-        let expected = book == nil ? "unknown" : "user-1"
-        check(lines[1]["speaker"] as? String == expected,
-              "first system line is \(expected) (got \(lines[1]["speaker"] ?? "nil"))")
-        check(lines[2]["speaker"] as? String == expected,
-              "same voice matched again, not re-enrolled (got \(lines[2]["speaker"] ?? "nil"))")
+        // Three submits, two of one voice and — below — one of another, all clustered when
+        // the meeting closed. Not while it ran: that is the whole change.
+        let system = lines.filter { $0["source"] as? String == "system" }
+        if voices == nil {
+            check(system.allSatisfy { $0["speaker"] as? String == "unknown" },
+                  "without speaker models every system line stays unknown")
+        } else {
+            check(system.allSatisfy { $0["seg"] != nil },
+                  "every system line points at its voiceprint")
+            check(system.map { $0["seg"] as? Int } == [0, 1],
+                  "and the indices run in order (got \(system.map { $0["seg"] as? Int }))")
+            check(system.allSatisfy { $0["speaker"] as? String == "s1" },
+                  "the same voice twice is one speaker (got "
+                  + "\(system.map { $0["speaker"] as? String }))")
+            check(VoicePrintFile.load(for: transcripts()[0]).count == 2,
+                  "the voiceprints travel with the published transcript")
 
-        if book != nil {
-            check(lines[1]["dist"] == nil, "a new speaker records no distance")
-            guard let d = lines[2]["dist"] as? Double else {
-                print("  FAIL  matched line records no distance"); exit(1)
-            }
-            check(d < 0.3, "self-distance is a confident match (got \(d))")
-
-            // The whole point of the gallery: identity outlives the process.
-            guard let reopened = SpeakerBook(models: models, threshold: 0.65, url: gallery)
-            else { print("  FAIL  could not reopen gallery"); exit(1) }
-            let tail = Array(pcm[(pcm.count / 2)...])
-            check(reopened.label(tail)?.id == "1",
-                  "reloaded gallery still matches a later slice of the same voice")
-
-            // Catches the one failure every check above would survive: an embedder
-            // returning a constant vector, collapsing everyone into user-1. Dropping
-            // every 6th sample raises rate and pitch ~1.2x, which moves the formants.
+            // The check that catches an embedder returning a constant vector, which would
+            // collapse everyone into one speaker while every assertion above still passed.
+            // Dropping every 6th sample raises rate and pitch ~1.2x, which moves the
+            // formants — a different person as far as the model is concerned.
             var pitched: [Float] = []
             for (i, v) in pcm.enumerated() where i % 6 != 0 { pitched.append(v) }
-            check(reopened.label(pitched)?.id == "2",
-                  "a different voice becomes a different speaker")
-
-            // MARK: drift — does `drift` actually reach the clustering
-            //
-            // Every match under `drift` EMA-blends the segment into the stored voiceprint.
-            // Left at FluidAudio's 0.45 the centroid walks toward whoever spoke last until
-            // it is the average voice in the room and matches everybody — which is how the
-            // real gallery ended up with two entries for months. That collapse needs
-            // hundreds of genuinely different voices to reproduce, so what is checked here
-            // is the knob itself: at 0 no match may touch the voiceprint, at 1 every match
-            // must. Get the parameter wrong and one of the two fails.
-            func moveAfterMatch(drift: Float, _ name: String) -> [Float] {
-                let url = out.appendingPathComponent("drift-\(name).json")
-                guard let a = SpeakerBook(models: models, threshold: 0.65, drift: drift, url: url)
-                else { print("  FAIL  could not open \(name) gallery"); exit(1) }
-                _ = a.label(pcm)                     // enrols user-1
-                a.close()
-                let enrolled = SpeakerNames.load(from: url)[0].currentEmbedding
-                guard let b = SpeakerBook(models: models, threshold: 0.65, drift: drift, url: url)
-                else { print("  FAIL  could not reopen \(name) gallery"); exit(1) }
-                _ = b.label(tail)                    // a confident match of the same voice
-                b.close()
-                let after = SpeakerNames.load(from: url)[0].currentEmbedding
-                check(enrolled.count == 256 && after.count == 256, "\(name) voiceprint is 256-d")
-                return zip(enrolled, after).map { $1 - $0 }
+            guard let a = voices?.embed(pcm), let b = voices?.embed(pitched) else {
+                print("  FAIL  could not embed"); exit(1)
             }
-            check(moveAfterMatch(drift: 0, "frozen").allSatisfy { $0 == 0 },
-                  "drift 0: a match leaves the stored voiceprint untouched")
-            check(moveAfterMatch(drift: 1, "loose").contains { $0 != 0 },
-                  "drift 1: a match does move it — the knob is wired to the clustering")
+            check(Cluster.distance(a, a) < 0.001 && Cluster.distance(a, b) > 0.6,
+                  "a different voice is a different voiceprint (got "
+                  + "\(Cluster.distance(a, b)))")
 
-            // MARK: the walk — `drift` caps one hop, nothing caps their sum
-            //
-            // Same voice over and over, with drift wide open: without the freeze the
-            // centroid keeps moving forever, which is how one entry ends up within
-            // `threshold` of everybody. Feeding it *one* voice understates the real
-            // damage (the room's other voices are what it walks toward) and is still
-            // enough to catch a freeze that stopped working.
-            let walk = out.appendingPathComponent("walk.json")
-            var prints: [[Float]] = []
-            for _ in 0..<25 {
-                guard let w = SpeakerBook(models: models, threshold: 0.65, drift: 1, url: walk)
-                else { print("  FAIL  could not open walk gallery"); exit(1) }
-                _ = w.label(pcm)
-                w.close()
-                prints.append(SpeakerNames.load(from: walk)[0].currentEmbedding)
-            }
-            let moved = zip(prints[prints.count - 2], prints[prints.count - 1])
-                .contains { $0 != $1 }
-            check(!moved, "a settled voiceprint stops moving (25 matches, drift wide open)")
-
-            // MARK: names stay out of the transcript
-            //
-            // Naming a voice must change what the *reader* sees and nothing the engine
-            // writes. If a name ever reaches this label again, it is baked into every
-            // later line and one rename retroactively renames every meeting — the bug the
-            // sidecar exists to prevent.
-            TranscriptNames.apply(["user-1": "Ana"], to: transcripts()[0])
-            guard let after = SpeakerBook(models: models, threshold: 0.65, url: gallery)
-            else { print("  FAIL  could not reopen gallery"); exit(1) }
-            check(after.label(tail)?.id == "1",
-                  "a named voice still identifies as an id, not a name "
-                  + "(got \(after.label(tail)?.id as Any))")
-            after.close()
-            check(TranscriptNames.load(for: transcripts()[0])["user-1"] == "Ana",
-                  "flushing the gallery does not disturb the transcript's names")
-            check(SpeakerNames.load(from: gallery).allSatisfy { $0.currentEmbedding.count == 256 },
-                  "and it keeps every voiceprint")
+            // Naming still cannot leak across meetings, and clustering must not have
+            // disturbed what the naming window writes.
+            TranscriptNames.apply(["s1": "Ana"], to: transcripts()[0])
+            check(TranscriptNames.load(for: transcripts()[0])["s1"] == "Ana",
+                  "a clustered meeting names the same way")
         }
 
         // A gap longer than `gapSec` starts a new file. gapSec: 0 makes any elapsed time

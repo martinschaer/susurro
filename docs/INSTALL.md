@@ -61,7 +61,7 @@ silently on login is worse than one you have to switch on.
 |---|---|
 | Transcripts | `~/.susurro/transcripts` — one JSONL file per meeting, `0700` |
 | Models | `~/.susurro/models` |
-| Voiceprints | `~/.susurro/speakers.json` — how a voice is recognised again, `0600` |
+| Voiceprints | `<transcript>.emb` — one per meeting, so it can be re-clustered later |
 | Speaker names | a `name` field on the transcript's own lines |
 | Meeting in progress | `~/.susurro/live` — moved into `transcripts` when it ends |
 | Settings | `~/.susurro/config.json` — optional, every key has a default |
@@ -70,11 +70,14 @@ Menu ▸ **Open transcripts…** opens the folder. Menu ▸ **Name speakers…**
 the `user-N` voices, one meeting at a time, with a sample of what each one said to help you
 tell them apart.
 
-**Names belong to one meeting.** `user-4` is a voice the app learned to recognise, not a
-person — over weeks it will sometimes file two people under one `user-N`, so a name that is
-right in Tuesday's call can be wrong in Friday's. Naming somebody changes that meeting and
-no other. What it does do is remember: the next time that voice turns up, the names you have
-already used are offered as suggestions, with the most-used first.
+**Names belong to one meeting.** `s1` is "whoever spoke most in this meeting", worked out
+by grouping that meeting's voices when it ends. It is not a person the app recognises across
+days — `s1` in Tuesday's call and `s1` in Friday's are unrelated. Naming somebody changes
+that meeting and no other. What it does do is remember: when the same name fits again, the
+names you have already used are offered as suggestions, most-used first.
+
+**The meeting in progress is not in the list.** It appears once it ends, which is also when
+its speakers are worked out.
 
 ## Known rough edges
 
