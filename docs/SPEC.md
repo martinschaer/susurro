@@ -327,7 +327,7 @@ works, you still get `system` lines, and the reason appears in the menu.
 
 ```
 susurro/
-  SPEC.md  SETUP.md  setup.sh  Makefile
+  SPEC.md  SETUP.md  NEXT.md  setup.sh  Makefile
   bridge.h              #include of whisper.h, via -import-objc-header
   Info.plist
   Sources/
