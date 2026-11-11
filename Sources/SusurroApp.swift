@@ -436,6 +436,28 @@ final class Engine {
 
     private var watching = false
 
+    /// End the meeting now and start the next one on the next line. The window clears only
+    /// once the old file is published, so lines already queued for it arrive first and are
+    /// cleared with it rather than spilling into the new one. Speech still being spoken at
+    /// the press goes to the new file.
+    func newTranscript() {
+        guard let t = transcriber else { live.clear(); return }
+        t.rotate { [live] in DispatchQueue.main.async { live.clear() } }
+    }
+
+    /// Send the window's name picks for `file` wherever they belong now: to the transcriber
+    /// while it may still hold the file, or straight onto the published copy once Listening
+    /// is off — `close` published everything it had.
+    func syncNames(_ file: URL) {
+        let picks = live.picks(in: file)
+        if let t = transcriber {
+            t.setNames(picks, for: file)
+        } else {
+            TranscriptNames.vote(picks, in: Transcriber.defaultDir
+                .appendingPathComponent(file.lastPathComponent))
+        }
+    }
+
     private func syncPreviews() {
         transcriber?.setPreviews(watching && !live.paused)
     }
@@ -532,8 +554,8 @@ final class Engine {
                     return
                 }
                 self.transcriber = t
-                t.onLine = { [live = self.live] line, epoch in
-                    DispatchQueue.main.async { live.receive(line, epoch: epoch) }
+                t.onLine = { [live = self.live] written, epoch in
+                    DispatchQueue.main.async { live.receive(written, epoch: epoch) }
                 }
                 t.onPreview = { [live = self.live] source, text, epoch in
                     DispatchQueue.main.async { live.preview(text, source: source, epoch: epoch) }

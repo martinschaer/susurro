@@ -333,9 +333,10 @@ works, you still get `system` lines, and the reason appears in the menu.
 Transcript tab, a Context tab, and an agent panel on the right. Closing the window leaves
 Listening alone.
 
-**Lines** arrive through `Transcriber.onLine` as each is written, so the window shows exactly
-what the file gets, `me` / `unknown` included — speakers do not exist until the meeting
-closes. Each line is one segment and is selectable on its own; *Clear selection* empties it.
+**Lines** arrive through `Transcriber.onLine` as each is written, with where in the file each
+one landed and a live guess at its voice — the file itself still says `unknown` on system
+lines until the meeting is clustered. A divider marks where one transcript file ends and
+the next begins, since live voice numbers restart with each file. Each line is one segment and is selectable on its own; *Clear selection* empties it.
 A text-size slider sits in the toolbar.
 
 **A preview runs ahead of the lines.** A talk rarely pauses for `silenceMs`, so segments
@@ -357,6 +358,37 @@ back, which is seconds later and would hide the sentence said just before Pause 
 the one said just before Resume. Even epochs show, odd ones hide. `cut` is the one
 `Segmenter` call made from main: it sets a locked epoch the next `push` applies on the audio
 thread.
+
+**Speakers are guessed live and named by hand.** Each system segment's voiceprint joins the
+nearest of this meeting's running centroids within `clusterThreshold`, or starts a new one
+(`LiveVoices`), so lines read `voice 1`, `voice 2` — deliberately not `s1`, which only
+exists once the meeting is clustered. That is a per-segment decision, the thing § Speakers
+says made labels unusable, so it stays out of the file: when the meeting ends it is still
+clustered from every segment at once, exactly as before.
+
+Clicking a line's speaker opens a menu: names used in this meeting, names from earlier
+meetings, *Type a name…*, *Clear name*. Picking a name for a voice with none names the whole
+voice; picking one on a voice that already has a name corrects just that line, because
+that is a misgrouped line, not a rename. Typing offers both explicitly. `unknown` lines (no
+voiceprint) are only ever named alone.
+
+The window spreads a voice's name over every line of it, but **only the line it was picked
+on reaches the file**. At publish, after clustering and before the move, `TranscriptNames.vote`
+takes the explicit picks by line index: whole-voice picks vote for their final `sN` cluster
+and the majority names it (ties alphabetical), `me` picks name every mic line, and
+just-this-line picks and picks on `unknown` lines name that line alone. Letting the spread
+names vote would let one wrong live merge write somebody's name onto someone else's
+cluster with nobody having said so. Names sent after a meeting was published — a silence
+gap rotated it, or Listening went off — are voted onto the published copy, ordered against
+the publish by the whisper queue. Voting adds and changes names; it never clears one.
+
+A line's index is counted only when it is actually written, so a dropped line cannot shift
+every name after it onto the wrong line.
+
+**New transcript** ends the meeting now — published, clustered and named like a silence gap
+— and clears the window. The rotation runs on the whisper queue, so lines already queued
+land in the old file, and the window clears only once they have arrived. Speech still
+being spoken at the press goes to the new file. Context and the agent conversation stay.
 
 **Context** is plain UTF-8 text: drop files, *Add files…*, or paste (⌘V / *Paste text*). The
 list lasts for this run of the app. Every document is also copied to `~/.susurro/context`

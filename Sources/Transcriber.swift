@@ -18,6 +18,19 @@ final class Transcriber {
     /// How many voiceprints this meeting has written, which is the next one's `seg`.
     private var segs = 0
 
+    /// Lines actually written to the current file — the next one's index, which is how the
+    /// live window addresses a line when it names it. Counted on write, not on attempt: a
+    /// line that never reached the file must not shift every index after it.
+    private var written = 0
+
+    /// This meeting's voices so far, for the live window. Reset with the file.
+    private var liveVoices: LiveVoices
+
+    /// Names picked in the live window for the file still being written, by line index.
+    /// Applied at `publish`, after the clustering and before the move, so a transcript never
+    /// reaches `dir` without them.
+    private var picks: [URL: [Int: NamePick]] = [:]
+
     // whisper stores these as `const char *` without copying, so they must outlive
     // every whisper_full call — hence strdup rather than a Swift String.
     private let vadPath: UnsafeMutablePointer<CChar>?
@@ -33,7 +46,17 @@ final class Transcriber {
 
     /// Every line as it is written, with the epoch its audio was captured in, on the
     /// whisper queue. The live window. Set before the first `submit`.
-    var onLine: ((TranscriptLine, Int) -> Void)?
+    var onLine: ((Written, Int) -> Void)?
+
+    /// A line as it landed: where, and which live voice it sounded like. `voice` is `me`,
+    /// `voice N`, or `unknown` when there was no voiceprint — never an `sN`, which only
+    /// exists once the meeting is clustered.
+    struct Written {
+        let line: TranscriptLine
+        let file: URL
+        let index: Int
+        let voice: String
+    }
 
     /// What the segment still being spoken says so far, by source, on the whisper queue.
     /// Display only: never written, never embedded. Empty text means "no preview any
@@ -77,6 +100,7 @@ final class Transcriber {
         self.liveDir = liveDir
         self.gapSec = gapSec
         self.clusterThreshold = clusterThreshold
+        liveVoices = LiveVoices(threshold: clusterThreshold)
         self.minSpeakerSec = minSpeakerSec
         var cp = whisper_context_default_params()
         cp.use_gpu = true              // Metal is off at build time; the Core ML
@@ -111,6 +135,30 @@ final class Transcriber {
         queue.async { [weak self] in
             self?.run(samples, source, epoch)
             self?.lock.withLock { self?.queued -= 1 }
+        }
+    }
+
+    /// Names from the live window for `file`, replacing any sent before. Ordered against
+    /// `publish` by the queue: still live, they wait for it; already published (a silence
+    /// gap rotated it, or Listening went off), they are voted onto the published copy.
+    func setNames(_ names: [Int: NamePick], for file: URL) {
+        queue.async { [self] in
+            if file == live {
+                picks[file] = names
+            } else {
+                TranscriptNames.vote(names, in: dir.appendingPathComponent(file.lastPathComponent))
+            }
+        }
+    }
+
+    /// End this meeting now: lines already queued land in it, the next one starts a new
+    /// file. `then` runs on the queue once it is published.
+    func rotate(then: @escaping () -> Void) {
+        queue.async { [self] in
+            try? handle?.close()
+            handle = nil
+            publish()
+            then()
         }
     }
 
@@ -177,18 +225,26 @@ final class Transcriber {
         // ever reaches the clustering.
         var speaker = "me"
         var seg: Int?
+        var print: [Float]?
         if source == "system" {
             speaker = "unknown"          // until this meeting is clustered
-            if let print = voices?.embed(samples), let file = live {
-                VoicePrintFile.append(print, to: VoicePrintFile.url(for: file))
-                seg = segs
-                segs += 1
-            }
+            print = voices?.embed(samples)
+        }
+
+        // Opens the file first if this line starts a meeting, so the voiceprint below goes
+        // in the new meeting's `.emb` and the live voices start from nothing.
+        rotateIfIdle()
+        if let print, let file = live {
+            VoicePrintFile.append(print, to: VoicePrintFile.url(for: file))
+            seg = segs
+            segs += 1
         }
 
         let line = append(text, source: source, speaker: speaker, seg: seg,
                           dur: Double(samples.count) / 16000, lang: lang)
-        onLine?(line, epoch)
+        guard let line, let file = live else { return }
+        let voice = print.map { "voice \(liveVoices.assign($0) + 1)" } ?? speaker
+        onLine?(Written(line: line, file: file, index: written - 1, voice: voice), epoch)
     }
 
     /// One whisper pass: the text and its language, or nil for nothing worth a line.
@@ -226,15 +282,15 @@ final class Transcriber {
 
     // MARK: - storage
 
-    @discardableResult
-    private func append(_ text: String, source: String, speaker: String, seg: Int?,
-                        dur: Double, lang: String) -> TranscriptLine {
-        // One file per meeting. Nothing runs while nobody is talking, so the gap between
-        // this line and the last one *is* the silence measurement — no timer needed. A
-        // session that spans midnight stays in one file, named for its first line.
+    /// One file per meeting. Nothing runs while nobody is talking, so the gap between this
+    /// line and the last one *is* the silence measurement — no timer needed. A session that
+    /// spans midnight stays in one file, named for its first line.
+    private func rotateIfIdle() {
         let now = Date()
         if handle == nil || now.timeIntervalSince(lastWrite) > gapSec {
             segs = 0
+            written = 0
+            liveVoices = LiveVoices(threshold: clusterThreshold)
             try? handle?.close()
             publish()                  // the meeting that just ended
             let url = liveDir.appendingPathComponent(
@@ -242,15 +298,21 @@ final class Transcriber {
             handle = Self.openFile(url)
             live = handle == nil ? nil : url
         }
-        lastWrite = now                // before the guard below: a dropped line must not
+        lastWrite = now                // even if the line is then dropped: it must not
                                        // strand the clock at the previous session
-        let line = TranscriptLine(ts: Self.isoFmt.string(from: now), source: source,
+    }
+
+    /// The line, or nil if it never reached the file.
+    private func append(_ text: String, source: String, speaker: String, seg: Int?,
+                        dur: Double, lang: String) -> TranscriptLine? {
+        let line = TranscriptLine(ts: Self.isoFmt.string(from: lastWrite), source: source,
                                   speaker: speaker, dur: (dur * 100).rounded() / 100,
                                   lang: lang, text: text, seg: seg, name: nil)
-        guard let data = try? JSONEncoder().encode(line), let h = handle else { return line }
+        guard let data = try? JSONEncoder().encode(line), let h = handle else { return nil }
         h.write(data)
         h.write(Data([0x0a]))
         try? h.synchronize()
+        written += 1
         return line
     }
 
@@ -259,15 +321,18 @@ final class Transcriber {
     private func publish() {
         guard let url = live else { return }
         live = nil
-        Self.publish(url, to: dir, threshold: clusterThreshold, minSeconds: minSpeakerSec)
+        Self.publish(url, to: dir, threshold: clusterThreshold, minSeconds: minSpeakerSec,
+                     picks: picks.removeValue(forKey: url) ?? [:])
     }
 
     /// Work out who spoke, then hand the meeting over to the readers. In that order: the
     /// clustering rewrites the whole file, which is safe here and nowhere else, and a
     /// transcript must never appear in `dir` still saying `unknown` on every line.
     private static func publish(_ url: URL, to dir: URL,
-                                threshold: Float, minSeconds: Double) {
+                                threshold: Float, minSeconds: Double,
+                                picks: [Int: NamePick] = [:]) {
         TranscriptSpeakers.assign(url, threshold: threshold, minSeconds: minSeconds)
+        TranscriptNames.vote(picks, in: url)      // onto the clusters just assigned
         let fm = FileManager.default
         try? fm.moveItem(at: url, to: dir.appendingPathComponent(url.lastPathComponent))
         // The voiceprints travel with the transcript: re-clustering it later is the point.

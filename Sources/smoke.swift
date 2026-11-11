@@ -191,6 +191,37 @@ enum Smoke {
         check(TranscriptSnippets.meetings(dir: snips).count == 4,
               "and the sidecar is gone rather than left to be re-applied forever")
 
+        // MARK: live naming — only explicit picks reach the file, onto the real clusters
+        //
+        // As if just clustered. s1 has two whole-voice votes for Ana and one for Bruno; a
+        // just-this-line pick inside s1 must survive the majority, a pick on an `unknown`
+        // line names only that line, `me` names every mic line, and s2's unpicked line
+        // stays unnamed even though its other line was named alone.
+        let voted = snips.appendingPathComponent("2026-01-05_10-00-00.jsonl")
+        let speakers = ["s1", "s1", "s1", "s2", "unknown", "me", "me", "s2", "s1"]
+        try speakers.enumerated().map { i, sp in
+            "{\"ts\":\"x\",\"speaker\":\"\(sp)\",\"text\":\"line \(i)\"}"
+        }.joined(separator: "\n").appending("\n").write(to: voted, atomically: true, encoding: .utf8)
+        TranscriptNames.vote([0: .init(name: "Ana", wholeVoice: true),
+                              1: .init(name: "Ana", wholeVoice: true),
+                              2: .init(name: "Bruno", wholeVoice: true),
+                              3: .init(name: "Carla", wholeVoice: false),
+                              4: .init(name: "Dan", wholeVoice: true),
+                              5: .init(name: "Martin", wholeVoice: true),
+                              8: .init(name: "Eve", wholeVoice: false)], in: voted)
+        let back = TranscriptSnippets.decode(voted)
+        let gotNames = back.map { $0?.name ?? "-" }
+        check(gotNames == ["Ana", "Ana", "Ana", "Carla", "Dan", "Martin", "Martin", "-", "Eve"],
+              "live picks: majority per cluster, line picks stay put, unknown and mic as told "
+              + "(got \(gotNames))")
+        check(back.enumerated().allSatisfy { $1?.text == "line \($0)" }, "and no text moved")
+
+        // MARK: live voices — the window's running guess, on hand-built vectors
+        var lv = LiveVoices(threshold: 0.4)
+        let groups = [lv.assign([1, 0, 0]), lv.assign([0.95, 0.1, 0]), lv.assign([0, 1, 0]),
+                      lv.assign([0.9, 0, 0.1])]
+        check(groups == [0, 0, 1, 0], "near voices join, a far one starts its own (got \(groups))")
+
         try? FileManager.default.removeItem(at: snips)
 
         // MARK: clustering — who spoke, decided from the whole meeting at once
@@ -431,13 +462,65 @@ enum Smoke {
               "a preview queued ahead of a line is skipped (got \(seen.count) previews)")
         check(transcripts().count == 3, "and the line is written")
 
+        // Where the window says a line is must be where it is, or a name lands on the wrong
+        // line. New transcript rotates: queued lines stay in the old file, indices restart,
+        // and a name sent while the file was live is on it when it is published.
+        sleep(1)
+        guard let t4 = Transcriber(model: model, vad: nil, dir: out, liveDir: hot) else {
+            print("  FAIL  reopen for rotate check"); exit(1)
+        }
+        var got: [(URL, Int)] = []
+        let gotLock = NSLock()
+        t4.onLine = { w, _ in gotLock.withLock { got.append((w.file, w.index)) } }
+        t4.submit(pcm, source: "mic")
+        t4.submit(pcm, source: "mic")
+        for _ in 0..<600 where gotLock.withLock({ got.count < 2 }) { usleep(50_000) }
+        // Sent while live: held, and applied at publish.
+        if let f = gotLock.withLock({ got.first?.0 }) {
+            t4.setNames([0: .init(name: "Ana", wholeVoice: false)], for: f)
+        }
+        let names = DispatchSemaphore(value: 0)
+        t4.rotate { names.signal() }
+        names.wait()
+        let before = gotLock.withLock { got }
+        // Sent after: voted straight onto the published copy.
+        if let f = before.first?.0 { t4.setNames([1: .init(name: "Martin", wholeVoice: false)], for: f) }
+        sleep(1)                       // the next file needs a different second
+        t4.submit(pcm, source: "mic")
+        t4.close()
+        let all = gotLock.withLock { got }
+        check(all.map(\.1) == [0, 1, 0] && Set(all.map(\.0)).count == 2,
+              "line indices follow the file, and restart in the new one (got \(all.map(\.1)))")
+        if let f = before.first?.0 {
+            let published = TranscriptSnippets.decode(out.appendingPathComponent(f.lastPathComponent))
+            check(published.map { $0?.name } == ["Ana", "Martin"],
+                  "names reach the file whether sent while live or after it was published "
+                  + "(got \(published.map { $0?.name }))")
+        }
+
+        // A session that opens with a system line: the file must exist before the voiceprint
+        // is taken, or that first line gets none and is never clustered.
+        if let voices {
+            sleep(1)
+            guard let t5 = Transcriber(model: model, vad: nil, voices: voices, dir: out,
+                                       liveDir: hot) else {
+                print("  FAIL  reopen for first-line check"); exit(1)
+            }
+            t5.submit(pcm, source: "system")
+            t5.close()
+            let first = transcripts().last!
+            check(TranscriptSnippets.decode(first).first??.seg == 0
+                  && VoicePrintFile.load(for: first).count == 1,
+                  "a session's first system line gets its voiceprint")
+        }
+
         // A meeting stranded by a crash is finished by definition: the next launch
         // publishes it rather than leaving it where nothing reads it.
         try "{\"ts\":\"x\",\"speaker\":\"user-1\",\"text\":\"orphaned\"}"
             .write(to: hot.appendingPathComponent("2026-01-09_09-00-00.jsonl"),
                    atomically: true, encoding: .utf8)
         _ = Transcriber(model: model, vad: nil, dir: out, liveDir: hot)
-        check(jsonl(hot).isEmpty && transcripts().count == 4,
+        check(jsonl(hot).isEmpty && transcripts().count == (voices == nil ? 6 : 7),
               "a transcript stranded by a crash is published on the next launch "
               + "(live \(jsonl(hot).count), published \(transcripts().count))")
 

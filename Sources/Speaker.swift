@@ -215,6 +215,42 @@ struct TranscriptLine: Codable {
     var name: String?
 }
 
+/// This meeting's voices *so far*, for the live window and nothing else.
+///
+/// Each new voiceprint joins the nearest running centroid within `threshold`, or starts a
+/// new voice. That is a per-segment decision on little evidence — the thing SPEC.md
+/// § Speakers says made labels unusable — which is why it never reaches the file: the
+/// meeting is still clustered from every segment at once when it ends, and only names the
+/// user explicitly picked carry over (`TranscriptNames.vote`).
+struct LiveVoices {
+    let threshold: Float
+    private var sums: [[Float]] = []   // unnormalised; `Cluster.distance` normalises
+
+    init(threshold: Float) { self.threshold = threshold }
+
+    /// The voice index this print belongs to, starting a new one if none is close.
+    mutating func assign(_ print: [Float]) -> Int {
+        var best: (i: Int, d: Float)?
+        for (i, sum) in sums.enumerated() {
+            let d = Cluster.distance(sum, print)
+            if d < best?.d ?? .infinity { best = (i, d) }
+        }
+        if let best, best.d <= threshold {
+            for k in sums[best.i].indices { sums[best.i][k] += print[k] }
+            return best.i
+        }
+        sums.append(print)
+        return sums.count - 1
+    }
+}
+
+/// A name the user gave in the live window, for one line: either for the voice that line
+/// belongs to, or for that line alone.
+struct NamePick: Equatable {
+    let name: String
+    let wholeVoice: Bool
+}
+
 /// Assigning `speaker` from the meeting's own clustering, once the file is closed.
 ///
 /// Separate from `TranscriptNames` only because one is the machine's opinion and the other
@@ -314,6 +350,41 @@ enum TranscriptNames {
             var line = line
             let name = typed.trimmingCharacters(in: .whitespacesAndNewlines)
             line.name = name.isEmpty ? nil : name
+            return line
+        }
+    }
+
+    /// Carry names picked in the live window onto a clustered transcript, by line index.
+    ///
+    /// Only explicit picks vote, never a name the window merely spread across a live group:
+    /// that grouping is a per-segment guess, and letting it vote would write one person's
+    /// name onto somebody else's cluster with nobody having said so.
+    ///
+    /// - a whole-voice pick on an `sN` line votes for its cluster; the majority names the
+    ///   whole cluster, ties alphabetical. On `me` it names every mic line.
+    /// - a whole-voice pick on an `unknown` line, and every just-this-line pick, names that
+    ///   line only — and wins over its cluster's name.
+    ///
+    /// Adds and changes names; never clears one. ponytail: a name removed in the window
+    /// after the meeting was published stays in the file; clear it in *Name speakers…*.
+    static func vote(_ picks: [Int: NamePick], in transcript: URL) {
+        guard !picks.isEmpty else { return }
+        let lines = TranscriptSnippets.decode(transcript)
+        var tally: [String: [String: Int]] = [:]
+        for (i, pick) in picks where pick.wholeVoice && lines.indices.contains(i) {
+            guard let speaker = lines[i]?.speaker, speaker != "unknown" else { continue }
+            tally[speaker, default: [:]][pick.name, default: 0] += 1
+        }
+        let winners = tally.compactMapValues { votes in
+            votes.max { $0.value < $1.value || ($0.value == $1.value && $0.key > $1.key) }?.key
+        }
+        TranscriptSpeakers.rewrite(transcript) { i, line in
+            var line = line
+            if let pick = picks[i], !pick.wholeVoice || line.speaker == "unknown" {
+                line.name = pick.name
+            } else if let name = winners[line.speaker] {
+                line.name = name
+            }
             return line
         }
     }

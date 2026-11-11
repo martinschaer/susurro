@@ -96,7 +96,7 @@ mid-sentence. If that is rare, this is not worth the battery.
 
 Done: *Live transcript…*, SPEC.md § Live transcript. It reads from `Transcriber.onLine`, not
 the live file, and keeps every line since Listening first went on in this run of the app —
-across session-gap file splits and off/on toggles, with no divider marking either.
+across session-gap file splits and off/on toggles, with a divider at each file split.
 
 ## Measure first
 

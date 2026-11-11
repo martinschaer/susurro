@@ -3,13 +3,23 @@ import SwiftUI
 
 // MARK: - live transcript
 
-/// One transcribed segment as the live window shows it, or a pause marker (`speaker` empty).
+/// One transcribed segment as the live window shows it, or a pause marker (no `file`).
 struct LiveLine: Identifiable {
     let id: Int
     let time: String
-    let speaker: String
+    /// `me`, `voice N` or `unknown`: the live grouping, not a name. `LiveTranscript.speaker`
+    /// is what to show.
+    let voice: String
     let text: String
-    var isBreak: Bool { speaker.isEmpty }
+    /// Where the line sits in its transcript, which is how a name reaches the file.
+    let file: URL?
+    let index: Int
+    var isBreak: Bool { file == nil }
+}
+
+/// One live voice in one meeting — `voice 2` in the next file is somebody else.
+struct LiveVoiceKey: Hashable {
+    let file: URL, voice: String
 }
 
 /// The meeting in progress, as far as the window is concerned.
@@ -30,10 +40,88 @@ final class LiveTranscript {
     /// never selectable — it is a draft of a line, and the line is what gets sent.
     private(set) var previews: [String: String] = [:]
 
+    /// A live voice's name, shown on every line of it. Spread by the live grouping, which
+    /// is a guess — so only the line it was picked on (`voicePicks`) votes on the file.
+    private var voiceNames: [LiveVoiceKey: String] = [:]
+    private var voicePicks: [Int: String] = [:]
+    /// Just-this-line names: a line the grouping put in the wrong voice.
+    private var lineNames: [Int: String] = [:]
+    /// Names from earlier meetings, most used first. Loaded once per window, not per row.
+    private(set) var pastNames: [String] = []
+
     var paused: Bool { epoch % 2 == 1 }
 
-    /// The selected segments, oldest first — the order they were said in.
-    var selection: [LiveLine] { lines.filter { selected.contains($0.id) && !$0.isBreak } }
+    /// The selected segments, oldest first — the order they were said in — as the agent
+    /// reads them: by name, not by live voice.
+    var selection: [String] {
+        lines.filter { selected.contains($0.id) && !$0.isBreak }
+            .map { "[\($0.time)] \(speaker($0)): \($0.text)" }
+    }
+
+    func speaker(_ l: LiveLine) -> String {
+        lineNames[l.id] ?? l.file.flatMap { voiceNames[LiveVoiceKey(file: $0, voice: l.voice)] }
+            ?? l.voice
+    }
+
+    func isNamed(_ l: LiveLine) -> Bool { speaker(l) != l.voice }
+
+    func hasOwnName(_ l: LiveLine) -> Bool { lineNames[l.id] != nil }
+
+    /// The names in use in `file`'s meeting, for the speaker menu.
+    func names(in file: URL?) -> [String] {
+        var out = Set(voiceNames.filter { $0.key.file == file }.values)
+        for l in lines where l.file == file { if let n = lineNames[l.id] { out.insert(n) } }
+        return out.sorted()
+    }
+
+    /// Name `l`'s whole voice, or `l` alone. Blank clears. Returns the file to sync.
+    func name(_ l: LiveLine, _ typed: String, wholeVoice: Bool) -> URL? {
+        guard let file = l.file else { return nil }
+        let name = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if wholeVoice, l.voice != "unknown" {
+            // A rename replaces the voice's earlier pick rather than outvoting it.
+            for other in lines where other.file == file && other.voice == l.voice {
+                voicePicks[other.id] = nil
+            }
+            lineNames[l.id] = nil
+            voiceNames[LiveVoiceKey(file: file, voice: l.voice)] = name.isEmpty ? nil : name
+            if !name.isEmpty { voicePicks[l.id] = name }
+        } else {
+            lineNames[l.id] = name.isEmpty ? nil : name
+        }
+        return file
+    }
+
+    /// A name picked from the menu names the voice if it has none yet. If it already has
+    /// one, picking another is a correction to this line: a voice called Ana with one line
+    /// picked as Bruno is a misgrouped line, not a rename.
+    func pick(_ l: LiveLine, _ name: String) -> URL? {
+        let named = l.file.map { voiceNames[LiveVoiceKey(file: $0, voice: l.voice)] != nil } ?? true
+        return self.name(l, name, wholeVoice: !named)
+    }
+
+    /// The explicit picks on one file, by line index, for `TranscriptNames.vote`.
+    func picks(in file: URL) -> [Int: NamePick] {
+        var out: [Int: NamePick] = [:]
+        for l in lines where l.file == file {
+            if let n = lineNames[l.id] {
+                out[l.index] = NamePick(name: n, wholeVoice: false)
+            } else if let n = voicePicks[l.id] {
+                out[l.index] = NamePick(name: n, wholeVoice: true)
+            }
+        }
+        return out
+    }
+
+    /// Scans every transcript once, so the menu can offer who you have named before.
+    func loadPastNames() {
+        var count: [String: Int] = [:]
+        for m in TranscriptSnippets.meetings() {
+            for v in m.voices { if let n = v.name { count[n, default: 0] += 1 } }
+        }
+        pastNames = count.sorted { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) }
+            .map(\.key)
+    }
 
     /// Flip, and return the new epoch for the segmenters to cut at.
     func toggle() -> Int {
@@ -45,11 +133,22 @@ final class LiveTranscript {
             // The marker goes in on resume, not on pause: by now the lines from before the
             // press have come back from whisper and sit above it, where they were said.
             let f = Date.FormatStyle.dateTime.hour().minute()
-            lines.append(LiveLine(id: lines.count, time: "",
-                                  speaker: "",
-                                  text: "paused \(from.formatted(f)) – \(Date().formatted(f))"))
+            lines.append(LiveLine(id: lines.count, time: "", voice: "",
+                                  text: "paused \(from.formatted(f)) – \(Date().formatted(f))",
+                                  file: nil, index: -1))
         }
         return epoch
+    }
+
+    /// A new transcript: the window starts over. The old file keeps its names — they went
+    /// with it at publish.
+    func clear() {
+        lines = []
+        selected = []
+        previews = [:]
+        voiceNames = [:]
+        voicePicks = [:]
+        lineNames = [:]
     }
 
     func preview(_ text: String, source: String, epoch e: Int) {
@@ -57,12 +156,20 @@ final class LiveTranscript {
         previews[source] = text.isEmpty ? nil : text
     }
 
-    func receive(_ l: TranscriptLine, epoch e: Int) {
-        if let source = l.source { previews[source] = nil }
+    func receive(_ w: Transcriber.Written, epoch e: Int) {
+        if let source = w.line.source { previews[source] = nil }
         guard e % 2 == 0 else { return }
+        // Voice numbers restart with each file, so a silence-gap split must be visible or
+        // two different people read `voice 1` on adjacent lines.
+        if let last = lines.last(where: { !$0.isBreak }), last.file != w.file {
+            let f = Date.FormatStyle.dateTime.hour().minute()
+            lines.append(LiveLine(id: lines.count, time: "", voice: "",
+                                  text: "new transcript \(Date().formatted(f))",
+                                  file: nil, index: -1))
+        }
         // "2026-08-10T14:32:07+02:00" → "14:32:07"
-        lines.append(LiveLine(id: lines.count, time: String(l.ts.dropFirst(11).prefix(8)),
-                              speaker: l.speaker, text: l.text))
+        lines.append(LiveLine(id: lines.count, time: String(w.line.ts.dropFirst(11).prefix(8)),
+                              voice: w.voice, text: w.line.text, file: w.file, index: w.index))
     }
 }
 
@@ -158,8 +265,9 @@ final class Agent {
 
     private static let system = """
         You are helping the user during a live conversation. Transcript excerpts are machine \
-        transcription of speech: "me" is the user's own microphone, "unknown" is anyone else \
-        on the call. Expect transcription errors. Be concise — the user is reading this while \
+        transcription of speech. A speaker is a name the user gave, "me" for the user's own \
+        microphone, "voice N" for a machine guess at one distinct voice (it can be wrong), or \
+        "unknown". Expect transcription errors. Be concise — the user is reading this while \
         the conversation continues.
         """
 
@@ -175,7 +283,7 @@ final class Agent {
 
     /// Documents new or changed since this conversation last saw them go along; the
     /// selected lines go every time, because the selection is what the question is about.
-    func ask(_ question: String, docs: [ContextDoc], lines: [LiveLine]) {
+    func ask(_ question: String, docs: [ContextDoc], lines: [String]) {
         guard !running else { return }
         let fresh = docs.filter { sent[$0.name] != $0.text }
         var parts: [String] = []
@@ -185,9 +293,8 @@ final class Agent {
             }.joined(separator: "\n") + "\n</context_documents>")
         }
         if !lines.isEmpty {
-            parts.append("<transcript_excerpt>\n" + lines.map {
-                "[\($0.time)] \($0.speaker): \($0.text)"
-            }.joined(separator: "\n") + "\n</transcript_excerpt>")
+            parts.append("<transcript_excerpt>\n" + lines.joined(separator: "\n")
+                         + "\n</transcript_excerpt>")
         }
         parts.append(question)
 
@@ -324,6 +431,9 @@ struct LiveView: View {
     @AppStorage("liveFontSize") private var fontSize = 14.0
     @State private var tab = 0
     @State private var question = ""
+    @State private var naming: LiveLine?        // the line "Type a name…" was chosen on
+    @State private var typedName = ""
+    @State private var confirmNew = false
 
     var body: some View {
         HSplitView {
@@ -342,7 +452,36 @@ struct LiveView: View {
             agentPanel.frame(minWidth: 300, idealWidth: 360)
         }
         .frame(minWidth: 720, minHeight: 440)
-        .onAppear { engine.setWatching(true) }
+        .confirmationDialog("Start a new transcript?", isPresented: $confirmNew) {
+            Button("New transcript") { engine.newTranscript() }
+        } message: {
+            Text("This meeting is saved, with its names, and the window starts empty. "
+                 + "Context and the agent conversation stay.")
+        }
+        .alert("Who said this?", isPresented: Binding(get: { naming != nil },
+                                                       set: { if !$0 { naming = nil } })) {
+            TextField("Name", text: $typedName)
+            if let l = naming, l.voice != "unknown" {
+                Button(l.voice == "me" ? "All my lines" : "Name \(l.voice)") {
+                    commit(l, wholeVoice: true)
+                }
+            }
+            if let l = naming { Button("Just this line") { commit(l, wholeVoice: false) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let l = naming {
+                switch l.voice {
+                case "unknown": Text("No voiceprint for this line, so it is named alone.")
+                case "me": Text("Your microphone: name every line from it, or just this one.")
+                default: Text("Naming \(l.voice) names every line it groups with — a guess until "
+                              + "the meeting ends, when the name moves to the real speaker.")
+                }
+            }
+        }
+        .onAppear {
+            engine.setWatching(true)
+            live.loadPastNames()
+        }
         .onDisappear { engine.setWatching(false) }
         .toolbar {
             ToolbarItem {
@@ -351,6 +490,10 @@ struct LiveView: View {
                     engine.togglePause()
                 }
                 .help(live.paused ? "Show new lines again" : "Stop showing new lines — the transcript file keeps recording")
+            }
+            ToolbarItem {
+                Button("New transcript", systemImage: "doc.badge.plus") { confirmNew = true }
+                    .help("End this transcript and start a new one")
             }
             ToolbarItem {
                 HStack(spacing: 4) {
@@ -416,30 +559,78 @@ struct LiveView: View {
                 .frame(maxWidth: .infinity)
         } else {
             let on = live.selected.contains(l.id)
-            // A Button, not onTapGesture, so a row stays keyboard-reachable.
-            Button {
-                if on { live.selected.remove(l.id) } else { live.selected.insert(l.id) }
-            } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(l.time)
-                        .font(.system(size: fontSize * 0.75).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .frame(width: fontSize * 3.6, alignment: .leading)
-                    Text(l.speaker)
-                        .font(.system(size: fontSize * 0.75))
-                        .foregroundStyle(l.speaker == "me" ? Color.accentColor : .secondary)
-                        .frame(minWidth: fontSize * 3.5, alignment: .leading)
-                    Text(l.text).font(.system(size: fontSize))
-                    Spacer(minLength: 0)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(l.time)
+                    .font(.system(size: fontSize * 0.75).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: fontSize * 3.6, alignment: .leading)
+                // Beside the selection button, not inside it: a menu in a button's label
+                // never gets the click.
+                speakerMenu(l)
+                // A Button, not onTapGesture, so a row stays keyboard-reachable.
+                Button {
+                    if on { live.selected.remove(l.id) } else { live.selected.insert(l.id) }
+                } label: {
+                    HStack {
+                        Text(l.text).font(.system(size: fontSize))
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .padding(.vertical, 2)
-                .padding(.horizontal, 4)
-                .background(on ? Color.accentColor.opacity(0.18) : .clear,
-                            in: RoundedRectangle(cornerRadius: 4))
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
+            .padding(.vertical, 2)
+            .padding(.horizontal, 4)
+            .background(on ? Color.accentColor.opacity(0.18) : .clear,
+                        in: RoundedRectangle(cornerRadius: 4))
         }
+    }
+
+    private func speakerMenu(_ l: LiveLine) -> some View {
+        let current = live.speaker(l)
+        let here = live.names(in: l.file).filter { $0 != current }
+        let before = live.pastNames.filter { $0 != current && !here.contains($0) }.prefix(12)
+        return Menu {
+            if !here.isEmpty {
+                Section("In this meeting") {
+                    ForEach(here, id: \.self) { n in Button(n) { sync(live.pick(l, n)) } }
+                }
+            }
+            if !before.isEmpty {
+                Section("Named before") {
+                    ForEach(Array(before), id: \.self) { n in Button(n) { sync(live.pick(l, n)) } }
+                }
+            }
+            Divider()
+            Button("Type a name…") {
+                typedName = live.isNamed(l) ? current : ""
+                naming = l
+            }
+            if live.isNamed(l) {
+                Button("Clear name") {
+                    sync(live.name(l, "", wholeVoice: !live.hasOwnName(l)))
+                }
+            }
+        } label: {
+            Text(current)
+                .font(.system(size: fontSize * 0.75))
+                .foregroundStyle(live.isNamed(l) || l.voice == "me" ? Color.accentColor : .secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .frame(minWidth: fontSize * 4.5, alignment: .leading)
+        .help("Who said this. A name picked for an unnamed voice names the whole voice; "
+              + "on a voice that already has a name it corrects just this line.")
+    }
+
+    private func commit(_ l: LiveLine, wholeVoice: Bool) {
+        sync(live.name(l, typedName, wholeVoice: wholeVoice))
+        naming = nil
+    }
+
+    private func sync(_ file: URL?) {
+        if let file { engine.syncNames(file) }
     }
 
     private func preview(_ source: String, _ text: String) -> some View {
@@ -450,7 +641,7 @@ struct LiveView: View {
                 .frame(width: fontSize * 3.6, alignment: .leading)
             Text(source == "mic" ? "me" : "…")
                 .font(.system(size: fontSize * 0.75))
-                .frame(minWidth: fontSize * 3.5, alignment: .leading)
+                .frame(minWidth: fontSize * 4.5, alignment: .leading)
             Text(text).font(.system(size: fontSize)).italic()
             Spacer(minLength: 0)
         }
