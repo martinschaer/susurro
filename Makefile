@@ -15,6 +15,11 @@ SWIFTC := $(HOME)/.swiftly/bin/swiftc -O -target arm64-apple-macosx14.2 \
           -I $(FAR)/Modules -I $(FA)/Sources/FastClusterWrapper/include \
           -I $(FA)/Sources/MachTaskSelfWrapper/include
 
+# swiftly's 6.3.3 cannot read the macOS 27 SDK CLT now defaults to (even `import
+# Foundation` fails, with "unknown argument: -target-arch-variant"). Pin the newest
+# SDK it can read; drop this once swiftly ships a toolchain that reads 27.
+export SDKROOT ?= /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+
 LINK := -L$(B)/src -L$(B)/ggml/src -L$(B)/ggml/src/ggml-blas \
         -lwhisper -lwhisper.coreml -lggml -lggml-base -lggml-cpu -lggml-blas \
         $(FAR)/libFluidAudio.a \
