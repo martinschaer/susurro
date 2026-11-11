@@ -31,6 +31,10 @@ final class Transcriber {
     private var lastWrite = Date.distantPast
     private var closed = false
 
+    /// Every line as it is written, with the epoch its audio was captured in, on the
+    /// whisper queue. The live window. Set before the first `submit`.
+    var onLine: ((TranscriptLine, Int) -> Void)?
+
     /// Where a transcript lives *while it is being written*. Not a detail: naming a voice
     /// rewrites the whole file, and this handle keeps a cached offset from
     /// `seekToEndOfFile()` that a rewrite underneath it would leave pointing mid-file, so
@@ -89,8 +93,8 @@ final class Transcriber {
     }
 
     /// Hand a finished segment over for transcription. Returns immediately.
-    func submit(_ samples: [Float], source: String) {
-        queue.async { [weak self] in self?.run(samples, source) }
+    func submit(_ samples: [Float], source: String, epoch: Int = 0) {
+        queue.async { [weak self] in self?.run(samples, source, epoch) }
     }
 
     /// Drain in-flight work, then release the model.
@@ -108,7 +112,7 @@ final class Transcriber {
 
     // MARK: - transcription
 
-    private func run(_ samples: [Float], _ source: String) {
+    private func run(_ samples: [Float], _ source: String, _ epoch: Int) {
         guard !closed, samples.count >= 4800 else { return }   // < 300 ms is not worth a pass
 
         var p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
@@ -155,14 +159,16 @@ final class Transcriber {
             }
         }
 
-        append(text, source: source, speaker: speaker, seg: seg,
-               dur: Double(samples.count) / 16000, lang: lang)
+        let line = append(text, source: source, speaker: speaker, seg: seg,
+                          dur: Double(samples.count) / 16000, lang: lang)
+        onLine?(line, epoch)
     }
 
     // MARK: - storage
 
+    @discardableResult
     private func append(_ text: String, source: String, speaker: String, seg: Int?,
-                        dur: Double, lang: String) {
+                        dur: Double, lang: String) -> TranscriptLine {
         // One file per meeting. Nothing runs while nobody is talking, so the gap between
         // this line and the last one *is* the silence measurement — no timer needed. A
         // session that spans midnight stays in one file, named for its first line.
@@ -181,10 +187,11 @@ final class Transcriber {
         let line = TranscriptLine(ts: Self.isoFmt.string(from: now), source: source,
                                   speaker: speaker, dur: (dur * 100).rounded() / 100,
                                   lang: lang, text: text, seg: seg, name: nil)
-        guard let data = try? JSONEncoder().encode(line), let h = handle else { return }
+        guard let data = try? JSONEncoder().encode(line), let h = handle else { return line }
         h.write(data)
         h.write(Data([0x0a]))
         try? h.synchronize()
+        return line
     }
 
     /// Hand a finished transcript over to the readers. Nothing appends to it after this,

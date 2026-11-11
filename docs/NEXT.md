@@ -92,15 +92,11 @@ speaker-change boundaries within the segment.
 principle: grep a week of meetings for lines where one cluster obviously holds two voices
 mid-sentence. If that is rare, this is not worth the battery.
 
-## 5. Make the live meeting visible
+## 5. ~~Make the live meeting visible~~
 
-**Problem.** A meeting in progress is in `~/.susurro/live` and appears nowhere in the UI, so
-during a call the app shows you nothing. That is a consequence of the segregation that makes
-rewriting safe, not a goal.
-
-**Shape.** A read-only view of the live file. Reading is safe; only writing is not. No
-speakers yet — they do not exist until it closes — so it is `me` and `unknown` with text,
-which is still worth having during a call.
+Done: *Live transcript…*, SPEC.md § Live transcript. It reads from `Transcriber.onLine`, not
+the live file, and keeps every line since Listening first went on in this run of the app —
+across session-gap file splits and off/on toggles, with no divider marking either.
 
 ## Measure first
 

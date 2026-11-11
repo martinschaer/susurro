@@ -21,7 +21,7 @@ enum Smoke {
     static func main() throws {
         // MARK: Segmenter — tone / silence / tone / silence -> exactly 2 utterances
         var segments: [[Float]] = []
-        let seg = Segmenter(config: Config()) { segments.append($0) }
+        let seg = Segmenter(config: Config()) { s, _ in segments.append(s) }
         seg.push(tone(1.0))
         seg.push(quiet(1.0))
         seg.push(tone(1.0))
@@ -29,9 +29,20 @@ enum Smoke {
         check(segments.count == 2, "segmenter cut 2 utterances (got \(segments.count))")
         check(segments.allSatisfy { $0.count > 16000 }, "each segment carries >1s of audio")
 
+        // Pause/resume cuts mid-speech, and what came before the press keeps its epoch —
+        // the live window hides by epoch, so a wrong stamp shows a paused line or hides
+        // a spoken one.
+        var cuts: [([Float], Int)] = []
+        let cutSeg = Segmenter(config: Config()) { cuts.append(($0, $1)) }
+        cutSeg.push(tone(1.0))
+        cutSeg.cut(to: 1)
+        cutSeg.push(tone(1.0))
+        cutSeg.push(quiet(1.0))
+        check(cuts.map(\.1) == [0, 1], "cut splits one utterance into epochs 0, 1 (got \(cuts.map(\.1)))")
+
         // A stream that never crosses the gate must produce nothing.
         var none: [[Float]] = []
-        let quietSeg = Segmenter(config: Config()) { none.append($0) }
+        let quietSeg = Segmenter(config: Config()) { s, _ in none.append(s) }
         quietSeg.push(quiet(3.0))
         check(none.isEmpty, "silence produces no segments")
 

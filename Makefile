@@ -3,7 +3,7 @@ B    := $(W)/build-mac
 FA   := vendor/fluidaudio
 FAR  := $(FA)/.build/arm64-apple-macosx/release
 APP  := Susurro.app
-SRC  := Sources/SusurroApp.swift Sources/Capture.swift Sources/Transcriber.swift Sources/Speaker.swift
+SRC  := Sources/SusurroApp.swift Sources/Live.swift Sources/Capture.swift Sources/Transcriber.swift Sources/Speaker.swift
 LIB  := Sources/Capture.swift Sources/Transcriber.swift Sources/Speaker.swift
 
 # swiftc comes from swiftly, not CommandLineTools, and the two are not interchangeable:

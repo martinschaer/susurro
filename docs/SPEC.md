@@ -10,6 +10,9 @@ the menu bar. Personal prototype, handed to beta testers as an ad-hoc-signed zip
 labels on the system stream that persist across days, menu bar on/off toggle, append-only
 per-meeting JSONL transcripts in `~/.susurro/transcripts`.
 
+**Also in:** a live window for the meeting in progress, with an agent (`claude -p`) that
+answers questions about selected lines plus context documents — see § Live transcript.
+
 **Out:** search UI, audio retention, splitting two speakers *inside* one segment,
 summarization, sync, notifications, preferences window, launch-at-login, auto-update,
 tests beyond one smoke check.
@@ -305,6 +308,7 @@ created on first write, so a session where nobody spoke leaves nothing behind.
 ```
 [✓] Listening          ⌘L      → toggles capture
     ─────────────────
+    Live transcript…           → switches Listening on, opens the live window
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
     Name speakers…             → one Window scene: meetings, then the voices in one
     ─────────────────
@@ -323,6 +327,44 @@ in-flight load if you toggle off before it finishes.
 A failure in one source does not take the other down: if the mic is refused but the tap
 works, you still get `system` lines, and the reason appears in the menu.
 
+## Live transcript
+
+*Live transcript…* switches Listening on (or leaves it on) and opens one window: a
+Transcript tab, a Context tab, and an agent panel on the right. Closing the window leaves
+Listening alone.
+
+**Lines** arrive through `Transcriber.onLine` as each is written, so the window shows exactly
+what the file gets, `me` / `unknown` included — speakers do not exist until the meeting
+closes. Each line is one segment and is selectable on its own; *Clear selection* empties it.
+A text-size slider sits in the toolbar.
+
+**Pause hides, it does not stop.** Capture and the JSONL carry on; the window just shows
+nothing new until Resume, and the paused stretch never appears in it. Every press also cuts
+both segmenters (`Segmenter.cut`), so the press is a segment boundary in the file too.
+What is hidden is decided by the *epoch the audio was captured in*, carried from the cut
+through `submit` to `onLine` — not by whether the window is paused when whisper's text comes
+back, which is seconds later and would hide the sentence said just before Pause and show
+the one said just before Resume. Even epochs show, odd ones hide. `cut` is the one
+`Segmenter` call made from main: it sets a locked epoch the next `push` applies on the audio
+thread.
+
+**Context** is plain UTF-8 text: drop files, *Add files…*, or paste (⌘V / *Paste text*). The
+list lasts for this run of the app. Every document is also copied to `~/.susurro/context`
+(`0700`/`0600`), which is all *Recent* lists, so a later run can re-add it in one click. Same
+name replaces.
+
+**The agent** is `claude -p --output-format stream-json --include-partial-messages`, prompt on
+stdin, chained into one conversation with `--resume <session_id>`; the pencil starts a new
+one. Each question sends the selected lines (always — they are what the question is about)
+and any context document new or changed since the conversation last saw it. It runs from
+`~/.susurro/agent`, because `--resume` looks sessions up per directory, with
+`--setting-sources ""` and `--strict-mcp-config`: your hooks, plugins and MCP servers have no
+business in the middle of a call. Tools are off (`--tools ""`) unless the panel's switch is
+on, which allows exactly `WebSearch,WebFetch,Read`, listed in both `--tools` and
+`--allowedTools` because in `-p` nobody can answer a permission prompt. A Finder-launched
+app has no shell `PATH`, so the binary is looked for in `~/.local/bin`, `~/.claude/local`,
+`/opt/homebrew/bin` and `/usr/local/bin`.
+
 ## Files
 
 ```
@@ -332,6 +374,7 @@ susurro/
   Info.plist
   Sources/
     SusurroApp.swift    MenuBarExtra, enable/disable wiring, the naming window
+    Live.swift          the live window: transcript, context documents, claude agent
     Capture.swift       mic + system tap + segmenter
     Transcriber.swift   whisper context, serial queue, JSONL append
     Speaker.swift       embedding + persisted gallery + per-transcript names
@@ -340,9 +383,11 @@ susurro/
   vendor/fluidaudio/    shallow clone at v0.15.5 + .build/ (SwiftPM -> one .a)
 ```
 
-Four Swift files in the app. The fourth is `Speaker.swift`, and the why is that model
+Five Swift files in the app. The fourth is `Speaker.swift`, and the why is that model
 loading plus a persisted gallery is a different lifecycle from the whisper context —
-inlining it would blur the one thing `Transcriber.swift` currently does well. If a fifth
+inlining it would blur the one thing `Transcriber.swift` currently does well. The fifth is
+`Live.swift`: the live window drives a subprocess and holds documents, which is neither
+capture nor naming, and `SusurroApp.swift` was already the largest file. If a sixth
 appears, ask why.
 
 `bridge.h` replaces a module map: `swiftc -import-objc-header bridge.h` exposes the whole

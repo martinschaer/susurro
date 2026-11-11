@@ -5,6 +5,8 @@ import SwiftUI
 @main
 struct SusurroApp: App {
     @State private var engine = Engine()
+    @State private var docs = ContextDocs()     // app lifetime, not window lifetime
+    @State private var agent = Agent()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -32,6 +34,11 @@ struct SusurroApp: App {
             }
 
             Divider()
+            Button("Live transcript…") {
+                engine.setEnabled(true)
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "live")
+            }
             Button("Open transcripts…") {
                 NSWorkspace.shared.activateFileViewerSelecting([Transcriber.defaultDir])
             }
@@ -52,6 +59,10 @@ struct SusurroApp: App {
 
         Window("Transcripts", id: "speakers") { TranscriptsView() }
             .windowResizability(.contentSize)
+
+        Window("Live transcript", id: "live") {
+            LiveView(engine: engine, live: engine.live, docs: docs, agent: agent)
+        }
     }
 }
 
@@ -395,13 +406,25 @@ final class Engine {
     /// Actually capturing, as opposed to merely switched on and still loading.
     var listening: Bool { enabled && !loading }
 
+    /// What the live window shows. Outlives any one `Transcriber`: toggling Listening off
+    /// and on mid-call keeps the lines, the selection and the pause state.
+    let live = LiveTranscript()
+
     private var transcriber: Transcriber?
+    private var segmenters: [Segmenter] = []
     private var mic: MicCapture?
     private var system: SystemCapture?
     private var generation = 0                // invalidates an in-flight load on toggle-off
     private var download: Process?            // held so it outlives this call
 
     func setEnabled(_ on: Bool) { on ? start() : stop() }
+
+    /// Pause or resume the live window. Capture never stops — the file keeps every word —
+    /// but both streams are cut right here, so the press is a segment boundary too.
+    func togglePause() {
+        let e = live.toggle()
+        segmenters.forEach { $0.cut(to: e) }
+    }
 
     /// Runs the `models.sh` bundled in Resources — the same script `setup.sh` calls, so
     /// there is one fetch path and not two. It is idempotent and resumable, so a failed
@@ -495,14 +518,21 @@ final class Engine {
                     return
                 }
                 self.transcriber = t
+                t.onLine = { [live = self.live] line, epoch in
+                    DispatchQueue.main.async { live.receive(line, epoch: epoch) }
+                }
 
                 // Two segmenters, one per source: that split is the speaker attribution.
-                let m = MicCapture(seg: Segmenter(config: cfg) { [weak t] s in
-                    t?.submit(s, source: "mic")
-                })
-                let s = SystemCapture(seg: Segmenter(config: cfg) { [weak t] s in
-                    t?.submit(s, source: "system")
-                })
+                let ms = Segmenter(config: cfg) { [weak t] s, e in
+                    t?.submit(s, source: "mic", epoch: e)
+                }
+                let ss = Segmenter(config: cfg) { [weak t] s, e in
+                    t?.submit(s, source: "system", epoch: e)
+                }
+                self.segmenters = [ms, ss]
+                self.segmenters.forEach { $0.cut(to: self.live.epoch) }   // paused stays paused
+                let m = MicCapture(seg: ms)
+                let s = SystemCapture(seg: ss)
 
                 // One source failing must not take the other down.
                 var failures: [String] = []
@@ -529,6 +559,7 @@ final class Engine {
         system?.stop()
         mic = nil
         system = nil
+        segmenters = []
         transcriber?.close()          // drains in-flight segments before freeing
         transcriber = nil
         enabled = false
