@@ -541,9 +541,13 @@ enum TranscriptSnippets {
     /// quote the wrong person. An undecodable line — the half-written tail of a file the
     /// engine is appending to — is context nobody gets instead.
     static func decode(_ file: URL) -> [TranscriptLine?] {
-        guard let body = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        guard let body = try? String(contentsOf: file, encoding: .utf8), !body.isEmpty
+        else { return [] }
         let decoder = JSONDecoder()
-        return body.split(separator: "\n").map {
+        // Empty lines kept, as `rewrite` keeps them: both address a line by its index. Only
+        // the nothing after the final newline is not a line.
+        return body.dropLast(body.hasSuffix("\n") ? 1 : 0)
+            .split(separator: "\n", omittingEmptySubsequences: false).map {
             try? decoder.decode(TranscriptLine.self, from: Data($0.utf8))
         }
     }

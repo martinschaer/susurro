@@ -67,11 +67,15 @@ final class LiveTranscript {
 
     func hasOwnName(_ l: LiveLine) -> Bool { lineNames[l.id] != nil }
 
-    /// The names in use in `file`'s meeting, for the speaker menu.
-    func names(in file: URL?) -> [String] {
+    /// The names in use in `file`'s meeting, for the speaker menu. Cached: every row asks on
+    /// every render, and only naming changes the answer.
+    func names(in file: URL?) -> [String] { file.flatMap { namesByFile[$0] } ?? [] }
+    private var namesByFile: [URL: [String]] = [:]
+
+    private func refreshNames(_ file: URL) {
         var out = Set(voiceNames.filter { $0.key.file == file }.values)
         for l in lines where l.file == file { if let n = lineNames[l.id] { out.insert(n) } }
-        return out.sorted()
+        namesByFile[file] = out.sorted()
     }
 
     /// Name `l`'s whole voice, or `l` alone. Blank clears. Returns the file to sync.
@@ -89,6 +93,7 @@ final class LiveTranscript {
         } else {
             lineNames[l.id] = name.isEmpty ? nil : name
         }
+        refreshNames(file)
         return file
     }
 
@@ -149,6 +154,7 @@ final class LiveTranscript {
         voiceNames = [:]
         voicePicks = [:]
         lineNames = [:]
+        namesByFile = [:]
     }
 
     func preview(_ text: String, source: String, epoch e: Int) {
@@ -190,18 +196,23 @@ final class ContextDocs {
 
     static let dir = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/context")
 
-    func add(_ url: URL) {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            problem = "\(url.lastPathComponent) is not a UTF-8 text file"
-            return
+    /// One drop or pick: the problem is cleared once, so a later good file cannot hide a bad one.
+    func add(_ urls: [URL]) {
+        problem = nil
+        for url in urls {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+                problem = "\(url.lastPathComponent) is not a UTF-8 text file"
+                continue
+            }
+            add(name: url.lastPathComponent, text: text)
         }
-        add(name: url.lastPathComponent, text: text)
     }
 
     func paste() {
         guard let text = NSPasteboard.general.string(forType: .string),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { problem = "Nothing to paste — the clipboard holds no text"; return }
+        problem = nil
         let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false))
         add(name: "Pasted \(stamp.replacingOccurrences(of: ":", with: "-")).txt", text: text)
     }
@@ -218,13 +229,13 @@ final class ContextDocs {
             (try? u.resourceValues(forKeys: Set(keys)).contentModificationDate) ?? .distantPast
         }
         return all.filter { !open.contains($0.lastPathComponent) }
-            .sorted { mtime($0) > mtime($1) }
-            .prefix(15).map { $0 }
+            .map { ($0, mtime($0)) }       // once per file, not per comparison
+            .sorted { $0.1 > $1.1 }
+            .prefix(15).map(\.0)
     }
 
     /// Same name replaces: re-adding an edited file must not send both versions.
     private func add(name: String, text: String) {
-        problem = nil
         docs.removeAll { $0.name == name }
         docs.append(ContextDoc(name: name, text: text))
         let fm = FileManager.default
@@ -329,13 +340,21 @@ final class Agent {
         p.standardOutput = output
         p.standardError = errors
 
+        // The turn ends when stdout hits EOF, stderr hits EOF *and* the process has exited,
+        // never at exit alone: exit can come before the last events are read, and the last
+        // line is the `result` event — for a failed login or an API error the only place the
+        // reason is. Every `handle` is queued on main before `notify`, so it runs after them.
+        let done = DispatchGroup()
+        done.enter(); done.enter(); done.enter()
+        p.terminationHandler = { _ in done.leave() }
+
         // A read can end mid-line; only whole lines are JSON.
         var pending = Data()
-        // Read to EOF rather than stopping at exit: the last line is the `result` event, and
-        // for a failed login or an API error it is the only place the reason is.
+        var eof = false
         output.fileHandleForReading.readabilityHandler = { [weak self] h in
+            guard !eof else { return }
             let chunk = h.availableData
-            if chunk.isEmpty { h.readabilityHandler = nil; return }
+            if chunk.isEmpty { eof = true; h.readabilityHandler = nil; done.leave(); return }
             pending.append(chunk)
             while let nl = pending.firstIndex(of: 0x0a) {
                 let line = pending[pending.startIndex..<nl]
@@ -345,25 +364,9 @@ final class Agent {
                 DispatchQueue.main.async { self?.handle(o, turn: i) }
             }
         }
-        var stderr = Data()
-        errors.fileHandleForReading.readabilityHandler = { stderr.append($0.availableData) }
-
-        p.terminationHandler = { [weak self] proc in
-            errors.fileHandleForReading.readabilityHandler = nil
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.running = false
-                self.process = nil
-                if self.session == nil { self.sent = [:] }   // nothing to resume into
-                if proc.terminationStatus != 0, self.turns[i].note == nil,
-                   self.turns[i].reply.isEmpty {
-                    let why = String(decoding: stderr, as: UTF8.self)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.turns[i].note = why.isEmpty ? "claude exited (\(proc.terminationStatus))" : why
-                }
-            }
-        }
-
+        // Writing to a child that already exited (Stop, a crash at startup) must be an
+        // error, not a SIGPIPE that takes the whole app — and the meeting's capture — down.
+        signal(SIGPIPE, SIG_IGN)
         do {
             try p.run()
         } catch {
@@ -372,11 +375,32 @@ final class Agent {
         }
         running = true
         process = p
-        for d in fresh { sent[d.name] = d.text }
+
+        var stderr = Data()
+        DispatchQueue.global().async {
+            stderr = errors.fileHandleForReading.readDataToEndOfFile()
+            done.leave()
+        }
+        done.notify(queue: .main) { [weak self] in
+            guard let self, self.turns.indices.contains(i) else { return }
+            self.running = false
+            self.process = nil
+            let status = p.terminationStatus
+            if status != 0, self.turns[i].note == nil, self.turns[i].reply.isEmpty {
+                let why = String(decoding: stderr, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.turns[i].note = why.isEmpty ? "claude exited (\(status))" : why
+            }
+            // Only a turn that worked put the documents into a conversation to resume.
+            if status == 0, self.turns[i].note == nil, self.session != nil {
+                for d in fresh { self.sent[d.name] = d.text }
+            }
+        }
+
         // Off main: context can be bigger than a pipe buffer.
         let data = Data(parts.joined(separator: "\n\n").utf8)
         DispatchQueue.global().async {
-            input.fileHandleForWriting.write(data)
+            try? input.fileHandleForWriting.write(contentsOf: data)
             try? input.fileHandleForWriting.close()
         }
     }
@@ -687,7 +711,7 @@ struct LiveView: View {
                 }
             }
             .dropDestination(for: URL.self) { urls, _ in
-                urls.forEach(docs.add)
+                docs.add(urls)
                 return !urls.isEmpty
             }
             .onPasteCommand(of: [.utf8PlainText, .plainText]) { _ in docs.paste() }
@@ -703,7 +727,7 @@ struct LiveView: View {
                     let recent = docs.recent()
                     if recent.isEmpty { Text("Nothing else used before") }
                     ForEach(recent, id: \.self) { u in
-                        Button(u.lastPathComponent) { docs.add(u) }
+                        Button(u.lastPathComponent) { docs.add([u]) }
                     }
                 }
                 .fixedSize()
@@ -717,7 +741,7 @@ struct LiveView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        if panel.runModal() == .OK { panel.urls.forEach(docs.add) }
+        if panel.runModal() == .OK { docs.add(panel.urls) }
     }
 
     // MARK: agent panel

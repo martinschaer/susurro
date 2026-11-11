@@ -198,23 +198,25 @@ enum Smoke {
         // line names only that line, `me` names every mic line, and s2's unpicked line
         // stays unnamed even though its other line was named alone.
         let voted = snips.appendingPathComponent("2026-01-05_10-00-00.jsonl")
-        let speakers = ["s1", "s1", "s1", "s2", "unknown", "me", "me", "s2", "s1"]
+        // A blank line too: `decode` and `rewrite` must agree on every index after it.
+        let speakers = ["s1", "s1", "s1", "s2", "", "unknown", "me", "me", "s2", "s1"]
         try speakers.enumerated().map { i, sp in
-            "{\"ts\":\"x\",\"speaker\":\"\(sp)\",\"text\":\"line \(i)\"}"
+            sp.isEmpty ? "" : "{\"ts\":\"x\",\"speaker\":\"\(sp)\",\"text\":\"line \(i)\"}"
         }.joined(separator: "\n").appending("\n").write(to: voted, atomically: true, encoding: .utf8)
         TranscriptNames.vote([0: .init(name: "Ana", wholeVoice: true),
                               1: .init(name: "Ana", wholeVoice: true),
                               2: .init(name: "Bruno", wholeVoice: true),
                               3: .init(name: "Carla", wholeVoice: false),
-                              4: .init(name: "Dan", wholeVoice: true),
-                              5: .init(name: "Martin", wholeVoice: true),
-                              8: .init(name: "Eve", wholeVoice: false)], in: voted)
+                              5: .init(name: "Dan", wholeVoice: true),
+                              6: .init(name: "Martin", wholeVoice: true),
+                              9: .init(name: "Eve", wholeVoice: false)], in: voted)
         let back = TranscriptSnippets.decode(voted)
         let gotNames = back.map { $0?.name ?? "-" }
-        check(gotNames == ["Ana", "Ana", "Ana", "Carla", "Dan", "Martin", "Martin", "-", "Eve"],
+        check(gotNames == ["Ana", "Ana", "Ana", "Carla", "-", "Dan", "Martin", "Martin", "-", "Eve"],
               "live picks: majority per cluster, line picks stay put, unknown and mic as told "
               + "(got \(gotNames))")
-        check(back.enumerated().allSatisfy { $1?.text == "line \($0)" }, "and no text moved")
+        check(back.enumerated().allSatisfy { $1 == nil ? $0 == 4 : $1?.text == "line \($0)" },
+              "and no text moved")
 
         // MARK: live voices — the window's running guess, on hand-built vectors
         var lv = LiveVoices(threshold: 0.4)

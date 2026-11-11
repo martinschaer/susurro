@@ -242,7 +242,10 @@ final class Transcriber {
 
         let line = append(text, source: source, speaker: speaker, seg: seg,
                           dur: Double(samples.count) / 16000, lang: lang)
-        guard let line, let file = live else { return }
+        guard let line, let file = live else {
+            onPreview?(source, "", epoch)
+            return
+        }
         let voice = print.map { "voice \(liveVoices.assign($0) + 1)" } ?? speaker
         onLine?(Written(line: line, file: file, index: written - 1, voice: voice), epoch)
     }

@@ -164,7 +164,11 @@ final class Segmenter {
     }
 
     private func flush() {
-        if voiced >= minSpeechFrames { emit(buf, epoch) }
+        if voiced >= minSpeechFrames {
+            emit(buf, epoch)
+        } else if previewed > 0 {
+            emit([], epoch)            // too short to transcribe: only clears its preview
+        }
         buf = []; preroll = []; speaking = false; silent = 0; voiced = 0; previewed = 0
     }
 }
