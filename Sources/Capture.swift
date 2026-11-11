@@ -72,7 +72,7 @@ struct Config {
 /// contains speech at all. Two cheap layers beat one expensive one.
 ///
 /// Not thread-safe by design — each capture source owns its own instance and pushes from
-/// a single audio thread.
+/// a single audio thread. The one exception is `cut`, which the UI calls from main.
 final class Segmenter {
     private let frame = 320            // 20 ms @ 16 kHz
     private let prerollFrames = 15     // 300 ms of lead-in, so we don't clip the first phoneme
@@ -80,7 +80,15 @@ final class Segmenter {
     private let silenceFrames: Int
     private let maxSamples: Int
     private let threshold: Float
-    private let emit: ([Float]) -> Void
+    /// The samples, and the epoch they were *captured* in. See `cut`.
+    private let emit: ([Float], Int) -> Void
+
+    /// The segment still being spoken, every `previewSamples` of growth: the live window's
+    /// running preview. Called on the audio thread like `emit`; set before the first push.
+    /// ponytail: fixed 2 s cadence; make it config if 2 s is wrong for someone's machine.
+    var onPreview: (([Float], Int) -> Void)?
+    private let previewSamples = 2 * 16000
+    private var previewed = 0          // buf.count at the last preview
 
     private var pending: [Float] = []  // sub-frame remainder between pushes
     private var buf: [Float] = []
@@ -89,14 +97,32 @@ final class Segmenter {
     private var silent = 0
     private var voiced = 0
 
-    init(config: Config, emit: @escaping ([Float]) -> Void) {
+    /// The epoch the audio in `buf` belongs to, and the one main has asked for.
+    private var epoch = 0
+    private var wanted = 0
+    private let lock = NSLock()
+
+    init(config: Config, emit: @escaping ([Float], Int) -> Void) {
         silenceFrames = max(1, config.silenceMs / 20)
         maxSamples = Int(config.maxSegmentSec * 16000)
         threshold = config.rmsThreshold
         self.emit = emit
     }
 
+    /// End the current segment here and stamp everything after it with `epoch`. The live
+    /// window's pause/resume: what was said before the press keeps the old epoch even
+    /// though whisper hands its text back seconds later. Applied on the next `push`, on
+    /// the audio thread — audio keeps arriving through silence, so that is never long.
+    func cut(to epoch: Int) {
+        lock.withLock { wanted = epoch }
+    }
+
     func push(_ samples: [Float]) {
+        let w = lock.withLock { wanted }
+        if w != epoch {
+            flush()
+            epoch = w
+        }
         pending += samples
         while pending.count >= frame {
             let f = Array(pending.prefix(frame))
@@ -129,12 +155,21 @@ final class Segmenter {
             if preroll.count > cap { preroll.removeFirst(preroll.count - cap) }
         }
 
-        if speaking && buf.count >= maxSamples { flush() }
+        if speaking && buf.count >= maxSamples {
+            flush()
+        } else if speaking, let onPreview, buf.count - previewed >= previewSamples {
+            previewed = buf.count
+            onPreview(buf, epoch)
+        }
     }
 
     private func flush() {
-        if voiced >= minSpeechFrames { emit(buf) }
-        buf = []; preroll = []; speaking = false; silent = 0; voiced = 0
+        if voiced >= minSpeechFrames {
+            emit(buf, epoch)
+        } else if previewed > 0 {
+            emit([], epoch)            // too short to transcribe: only clears its preview
+        }
+        buf = []; preroll = []; speaking = false; silent = 0; voiced = 0; previewed = 0
     }
 }
 

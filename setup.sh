@@ -9,6 +9,10 @@ FA_TAG=v0.15.5
 FA_REL="$FA/.build/arm64-apple-macosx/release"
 SWIFT="$HOME/.swiftly/bin/swift"
 
+# Same pin as the Makefile: swiftly's 6.3.3 cannot read the macOS 27 SDK, so every
+# `import Foundation` in FluidAudio fails. Override from the environment if 26.5 is absent.
+export SDKROOT="${SDKROOT:-/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk}"
+
 # 1. whisper.cpp source
 if [ ! -d "$W" ]; then
   echo "cloning whisper.cpp"

@@ -1,0 +1,825 @@
+import AppKit
+import SwiftUI
+
+// MARK: - live transcript
+
+/// One transcribed segment as the live window shows it, or a pause marker (no `file`).
+struct LiveLine: Identifiable {
+    let id: Int
+    let time: String
+    /// `me`, `voice N` or `unknown`: the live grouping, not a name. `LiveTranscript.speaker`
+    /// is what to show.
+    let voice: String
+    let text: String
+    /// Where the line sits in its transcript, which is how a name reaches the file.
+    let file: URL?
+    let index: Int
+    var isBreak: Bool { file == nil }
+}
+
+/// One live voice in one meeting — `voice 2` in the next file is somebody else.
+struct LiveVoiceKey: Hashable {
+    let file: URL, voice: String
+}
+
+/// The meeting in progress, as far as the window is concerned.
+///
+/// Pausing hides, it does not stop: the transcript file keeps everything. Hiding is decided
+/// by the *epoch the audio was captured in*, never by when whisper's text comes back — that
+/// is seconds later, and checking `paused` on arrival hides the sentence said just before
+/// the press and shows the one said just before resuming. Even epochs show, odd ones hide.
+@Observable
+final class LiveTranscript {
+    private(set) var lines: [LiveLine] = []
+    private(set) var epoch = 0
+    var selected: Set<Int> = []
+    private var pausedAt: Date?
+
+    /// What each source is saying right now, before its line exists: re-transcribed every
+    /// two seconds of speech and replaced by the real line when the segment ends. Shown,
+    /// never selectable — it is a draft of a line, and the line is what gets sent.
+    private(set) var previews: [String: String] = [:]
+
+    /// A live voice's name, shown on every line of it. Spread by the live grouping, which
+    /// is a guess — so only the line it was picked on (`voicePicks`) votes on the file.
+    private var voiceNames: [LiveVoiceKey: String] = [:]
+    private var voicePicks: [Int: String] = [:]
+    /// Just-this-line names: a line the grouping put in the wrong voice.
+    private var lineNames: [Int: String] = [:]
+    /// Names from earlier meetings, most used first. Loaded once per window, not per row.
+    private(set) var pastNames: [String] = []
+
+    var paused: Bool { epoch % 2 == 1 }
+
+    /// The selected segments, oldest first — the order they were said in — as the agent
+    /// reads them: by name, not by live voice.
+    var selection: [String] {
+        lines.filter { selected.contains($0.id) && !$0.isBreak }
+            .map { "[\($0.time)] \(speaker($0)): \($0.text)" }
+    }
+
+    func speaker(_ l: LiveLine) -> String {
+        lineNames[l.id] ?? l.file.flatMap { voiceNames[LiveVoiceKey(file: $0, voice: l.voice)] }
+            ?? l.voice
+    }
+
+    func isNamed(_ l: LiveLine) -> Bool { speaker(l) != l.voice }
+
+    func hasOwnName(_ l: LiveLine) -> Bool { lineNames[l.id] != nil }
+
+    /// The names in use in `file`'s meeting, for the speaker menu. Cached: every row asks on
+    /// every render, and only naming changes the answer.
+    func names(in file: URL?) -> [String] { file.flatMap { namesByFile[$0] } ?? [] }
+    private var namesByFile: [URL: [String]] = [:]
+
+    private func refreshNames(_ file: URL) {
+        var out = Set(voiceNames.filter { $0.key.file == file }.values)
+        for l in lines where l.file == file { if let n = lineNames[l.id] { out.insert(n) } }
+        namesByFile[file] = out.sorted()
+    }
+
+    /// Name `l`'s whole voice, or `l` alone. Blank clears. Returns the file to sync.
+    func name(_ l: LiveLine, _ typed: String, wholeVoice: Bool) -> URL? {
+        guard let file = l.file else { return nil }
+        let name = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if wholeVoice, l.voice != "unknown" {
+            // A rename replaces the voice's earlier pick rather than outvoting it.
+            for other in lines where other.file == file && other.voice == l.voice {
+                voicePicks[other.id] = nil
+            }
+            lineNames[l.id] = nil
+            voiceNames[LiveVoiceKey(file: file, voice: l.voice)] = name.isEmpty ? nil : name
+            if !name.isEmpty { voicePicks[l.id] = name }
+        } else {
+            lineNames[l.id] = name.isEmpty ? nil : name
+        }
+        refreshNames(file)
+        return file
+    }
+
+    /// A name picked from the menu names the voice if it has none yet. If it already has
+    /// one, picking another is a correction to this line: a voice called Ana with one line
+    /// picked as Bruno is a misgrouped line, not a rename.
+    func pick(_ l: LiveLine, _ name: String) -> URL? {
+        let named = l.file.map { voiceNames[LiveVoiceKey(file: $0, voice: l.voice)] != nil } ?? true
+        return self.name(l, name, wholeVoice: !named)
+    }
+
+    /// The explicit picks on one file, by line index, for `TranscriptNames.vote`.
+    func picks(in file: URL) -> [Int: NamePick] {
+        var out: [Int: NamePick] = [:]
+        for l in lines where l.file == file {
+            if let n = lineNames[l.id] {
+                out[l.index] = NamePick(name: n, wholeVoice: false)
+            } else if let n = voicePicks[l.id] {
+                out[l.index] = NamePick(name: n, wholeVoice: true)
+            }
+        }
+        return out
+    }
+
+    /// Scans every transcript once, so the menu can offer who you have named before.
+    func loadPastNames() {
+        var count: [String: Int] = [:]
+        for m in TranscriptSnippets.meetings() {
+            for v in m.voices { if let n = v.name { count[n, default: 0] += 1 } }
+        }
+        pastNames = count.sorted { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) }
+            .map(\.key)
+    }
+
+    /// Flip, and return the new epoch for the segmenters to cut at.
+    func toggle() -> Int {
+        epoch += 1
+        if paused {
+            pausedAt = Date()
+            previews = [:]
+        } else if let from = pausedAt {
+            // The marker goes in on resume, not on pause: by now the lines from before the
+            // press have come back from whisper and sit above it, where they were said.
+            let f = Date.FormatStyle.dateTime.hour().minute()
+            lines.append(LiveLine(id: lines.count, time: "", voice: "",
+                                  text: "paused \(from.formatted(f)) – \(Date().formatted(f))",
+                                  file: nil, index: -1))
+        }
+        return epoch
+    }
+
+    /// A new transcript: the window starts over. The old file keeps its names — they went
+    /// with it at publish.
+    func clear() {
+        lines = []
+        selected = []
+        previews = [:]
+        voiceNames = [:]
+        voicePicks = [:]
+        lineNames = [:]
+        namesByFile = [:]
+    }
+
+    func preview(_ text: String, source: String, epoch e: Int) {
+        guard e % 2 == 0, !paused else { return }
+        previews[source] = text.isEmpty ? nil : text
+    }
+
+    func receive(_ w: Transcriber.Written, epoch e: Int) {
+        if let source = w.line.source { previews[source] = nil }
+        guard e % 2 == 0 else { return }
+        // Voice numbers restart with each file, so a silence-gap split must be visible or
+        // two different people read `voice 1` on adjacent lines.
+        if let last = lines.last(where: { !$0.isBreak }), last.file != w.file {
+            let f = Date.FormatStyle.dateTime.hour().minute()
+            lines.append(LiveLine(id: lines.count, time: "", voice: "",
+                                  text: "new transcript \(Date().formatted(f))",
+                                  file: nil, index: -1))
+        }
+        // "2026-08-10T14:32:07+02:00" → "14:32:07"
+        lines.append(LiveLine(id: lines.count, time: String(w.line.ts.dropFirst(11).prefix(8)),
+                              voice: w.voice, text: w.line.text, file: w.file, index: w.index))
+    }
+}
+
+// MARK: - context documents
+
+struct ContextDoc: Identifiable {
+    let id = UUID()
+    let name: String
+    let text: String
+}
+
+/// What the agent is told besides the transcript. The list is this run of the app only;
+/// every document is also copied to `dir` so a later run can offer it under Recent.
+@Observable
+final class ContextDocs {
+    private(set) var docs: [ContextDoc] = []
+    var problem: String?
+
+    static let dir = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/context")
+
+    /// One drop or pick: the problem is cleared once, so a later good file cannot hide a bad one.
+    func add(_ urls: [URL]) {
+        problem = nil
+        for url in urls {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+                problem = "\(url.lastPathComponent) is not a UTF-8 text file"
+                continue
+            }
+            add(name: url.lastPathComponent, text: text)
+        }
+    }
+
+    func paste() {
+        guard let text = NSPasteboard.general.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { problem = "Nothing to paste — the clipboard holds no text"; return }
+        problem = nil
+        let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false))
+        add(name: "Pasted \(stamp.replacingOccurrences(of: ":", with: "-")).txt", text: text)
+    }
+
+    func remove(_ d: ContextDoc) { docs.removeAll { $0.id == d.id } }
+
+    /// Saved documents not already in the list, newest first.
+    func recent() -> [URL] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        let all = (try? FileManager.default.contentsOfDirectory(
+            at: Self.dir, includingPropertiesForKeys: keys)) ?? []
+        let open = Set(docs.map(\.name))
+        func mtime(_ u: URL) -> Date {
+            (try? u.resourceValues(forKeys: Set(keys)).contentModificationDate) ?? .distantPast
+        }
+        return all.filter { !open.contains($0.lastPathComponent) }
+            .map { ($0, mtime($0)) }       // once per file, not per comparison
+            .sorted { $0.1 > $1.1 }
+            .prefix(15).map(\.0)
+    }
+
+    /// Same name replaces: re-adding an edited file must not send both versions.
+    private func add(name: String, text: String) {
+        docs.removeAll { $0.name == name }
+        docs.append(ContextDoc(name: name, text: text))
+        let fm = FileManager.default
+        try? fm.createDirectory(at: Self.dir, withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+        fm.createFile(atPath: Self.dir.appendingPathComponent(name).path,
+                      contents: Data(text.utf8), attributes: [.posixPermissions: 0o600])
+    }
+}
+
+// MARK: - agent
+
+struct AgentTurn: Identifiable {
+    let id = UUID()
+    let prompt: String
+    let attached: String
+    var reply = ""
+    var note: String?
+}
+
+/// One `claude -p` per question, chained with `--resume` into a single conversation.
+///
+/// Run from a fixed directory because `--resume` looks sessions up per project directory,
+/// and with the user's settings, hooks and MCP servers switched off: this is a meeting
+/// assistant, not their coding setup, and a SessionStart hook or a slow MCP server has no
+/// business in the middle of a call. Auth still comes from their normal `claude` login.
+@Observable
+final class Agent {
+    private(set) var turns: [AgentTurn] = []
+    private(set) var running = false
+    var tools = false
+
+    private var session: String?
+    private var sent: [String: String] = [:]   // document name → text already in the session
+    private var process: Process?
+
+    static let dir = URL(fileURLWithPath: NSHomeDirectory() + "/.susurro/agent")
+
+    private static let system = """
+        You are helping the user during a live conversation. Transcript excerpts are machine \
+        transcription of speech. A speaker is a name the user gave, "me" for the user's own \
+        microphone, "voice N" for a machine guess at one distinct voice (it can be wrong), or \
+        "unknown". Expect transcription errors. Be concise — the user is reading this while \
+        the conversation continues.
+        """
+
+    /// A Finder-launched app gets PATH=/usr/bin:/bin, so look where installers put it.
+    /// ponytail: fixed list; an nvm-managed npm install is not on it.
+    private static var claude: URL? {
+        let home = NSHomeDirectory()
+        return [home + "/.local/bin/claude", home + "/.claude/local/claude",
+                "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+            .map(URL.init(fileURLWithPath:))
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    /// Documents new or changed since this conversation last saw them go along; the
+    /// selected lines go every time, because the selection is what the question is about.
+    func ask(_ question: String, docs: [ContextDoc], lines: [String]) {
+        guard !running else { return }
+        let fresh = docs.filter { sent[$0.name] != $0.text }
+        var parts: [String] = []
+        if !fresh.isEmpty {
+            parts.append("<context_documents>\n" + fresh.map {
+                "<document name=\"\($0.name)\">\n\($0.text)\n</document>"
+            }.joined(separator: "\n") + "\n</context_documents>")
+        }
+        if !lines.isEmpty {
+            parts.append("<transcript_excerpt>\n" + lines.joined(separator: "\n")
+                         + "\n</transcript_excerpt>")
+        }
+        parts.append(question)
+
+        var attached: [String] = []
+        if !fresh.isEmpty { attached.append("\(fresh.count) document\(fresh.count == 1 ? "" : "s")") }
+        if !lines.isEmpty { attached.append("\(lines.count) line\(lines.count == 1 ? "" : "s")") }
+        turns.append(AgentTurn(prompt: question, attached: attached.joined(separator: " · ")))
+        let i = turns.count - 1
+
+        guard let exe = Self.claude else {
+            turns[i].note = "claude CLI not found — install it from code.claude.com"
+            return
+        }
+        try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+
+        var args = ["-p", "--output-format", "stream-json", "--verbose",
+                    "--include-partial-messages", "--setting-sources", "",
+                    "--strict-mcp-config", "--append-system-prompt", Self.system]
+        let readOnly = "WebSearch,WebFetch,Read"
+        // In -p nobody can answer a permission prompt, so a tool must be listed as both
+        // available and allowed, or it is silently denied.
+        args += tools ? ["--tools", readOnly, "--allowedTools", readOnly] : ["--tools", ""]
+        if let session { args += ["--resume", session] }
+
+        let p = Process()
+        p.executableURL = exe
+        p.arguments = args
+        p.currentDirectoryURL = Self.dir
+        let input = Pipe(), output = Pipe(), errors = Pipe()
+        p.standardInput = input
+        p.standardOutput = output
+        p.standardError = errors
+
+        // The turn ends when stdout hits EOF, stderr hits EOF *and* the process has exited,
+        // never at exit alone: exit can come before the last events are read, and the last
+        // line is the `result` event — for a failed login or an API error the only place the
+        // reason is. Every `handle` is queued on main before `notify`, so it runs after them.
+        let done = DispatchGroup()
+        done.enter(); done.enter(); done.enter()
+        p.terminationHandler = { _ in done.leave() }
+
+        // A read can end mid-line; only whole lines are JSON.
+        var pending = Data()
+        var eof = false
+        output.fileHandleForReading.readabilityHandler = { [weak self] h in
+            guard !eof else { return }
+            let chunk = h.availableData
+            if chunk.isEmpty { eof = true; h.readabilityHandler = nil; done.leave(); return }
+            pending.append(chunk)
+            while let nl = pending.firstIndex(of: 0x0a) {
+                let line = pending[pending.startIndex..<nl]
+                pending.removeSubrange(pending.startIndex...nl)
+                guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+                else { continue }
+                DispatchQueue.main.async { self?.handle(o, turn: i) }
+            }
+        }
+        // Writing to a child that already exited (Stop, a crash at startup) must be an
+        // error, not a SIGPIPE that takes the whole app — and the meeting's capture — down.
+        signal(SIGPIPE, SIG_IGN)
+        do {
+            try p.run()
+        } catch {
+            turns[i].note = "could not start claude: \(error.localizedDescription)"
+            return
+        }
+        running = true
+        process = p
+
+        var stderr = Data()
+        DispatchQueue.global().async {
+            stderr = errors.fileHandleForReading.readDataToEndOfFile()
+            done.leave()
+        }
+        done.notify(queue: .main) { [weak self] in
+            guard let self, self.turns.indices.contains(i) else { return }
+            self.running = false
+            self.process = nil
+            let status = p.terminationStatus
+            if status != 0, self.turns[i].note == nil, self.turns[i].reply.isEmpty {
+                let why = String(decoding: stderr, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.turns[i].note = why.isEmpty ? "claude exited (\(status))" : why
+            }
+            // Only a turn that worked put the documents into a conversation to resume.
+            if status == 0, self.turns[i].note == nil, self.session != nil {
+                for d in fresh { self.sent[d.name] = d.text }
+            }
+        }
+
+        // Off main: context can be bigger than a pipe buffer.
+        let data = Data(parts.joined(separator: "\n\n").utf8)
+        DispatchQueue.global().async {
+            try? input.fileHandleForWriting.write(contentsOf: data)
+            try? input.fileHandleForWriting.close()
+        }
+    }
+
+    func stop() { process?.terminate() }
+
+    func reset() {
+        guard !running else { return }
+        turns = []
+        session = nil
+        sent = [:]
+    }
+
+    private func handle(_ o: [String: Any], turn i: Int) {
+        guard turns.indices.contains(i) else { return }
+        if session == nil, let id = o["session_id"] as? String { session = id }
+        switch o["type"] as? String {
+        case "stream_event":
+            guard let e = o["event"] as? [String: Any] else { return }
+            switch e["type"] as? String {
+            case "content_block_delta":
+                if let d = e["delta"] as? [String: Any], d["type"] as? String == "text_delta",
+                   let t = d["text"] as? String { turns[i].reply += t }
+            case "content_block_start":
+                if let b = e["content_block"] as? [String: Any], b["type"] as? String == "tool_use",
+                   let name = b["name"] as? String { turns[i].reply += "\n\n*using \(name)…*\n\n" }
+            case "message_start":
+                // Text after a tool call is a new message; do not glue it to the last word.
+                if !turns[i].reply.isEmpty, !turns[i].reply.hasSuffix("\n") { turns[i].reply += "\n\n" }
+            default: break
+            }
+        case "result":
+            let text = o["result"] as? String ?? ""
+            if o["is_error"] as? Bool == true {
+                turns[i].note = text.isEmpty ? "claude reported an error" : text
+            } else if turns[i].reply.isEmpty {
+                turns[i].reply = text
+            }
+        default: break
+        }
+    }
+}
+
+// MARK: - window
+
+struct LiveView: View {
+    let engine: Engine
+    let live: LiveTranscript
+    let docs: ContextDocs
+    @Bindable var agent: Agent
+
+    @AppStorage("liveFontSize") private var fontSize = 14.0
+    @State private var tab = 0
+    @State private var question = ""
+    @State private var naming: LiveLine?        // the line "Type a name…" was chosen on
+    @State private var typedName = ""
+    @State private var confirmNew = false
+
+    var body: some View {
+        HSplitView {
+            VStack(spacing: 0) {
+                Picker("", selection: $tab) {
+                    Text("Transcript").tag(0)
+                    Text(docs.docs.isEmpty ? "Context" : "Context (\(docs.docs.count))").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(8)
+                if tab == 0 { transcript } else { context }
+            }
+            .frame(minWidth: 380)
+
+            agentPanel.frame(minWidth: 300, idealWidth: 360)
+        }
+        .frame(minWidth: 720, minHeight: 440)
+        .confirmationDialog("Start a new transcript?", isPresented: $confirmNew) {
+            Button("New transcript") { engine.newTranscript() }
+        } message: {
+            Text("This meeting is saved, with its names, and the window starts empty. "
+                 + "Context and the agent conversation stay.")
+        }
+        .alert("Who said this?", isPresented: Binding(get: { naming != nil },
+                                                       set: { if !$0 { naming = nil } })) {
+            TextField("Name", text: $typedName)
+            if let l = naming, l.voice != "unknown" {
+                Button(l.voice == "me" ? "All my lines" : "Name \(l.voice)") {
+                    commit(l, wholeVoice: true)
+                }
+            }
+            if let l = naming { Button("Just this line") { commit(l, wholeVoice: false) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let l = naming {
+                switch l.voice {
+                case "unknown": Text("No voiceprint for this line, so it is named alone.")
+                case "me": Text("Your microphone: name every line from it, or just this one.")
+                default: Text("Naming \(l.voice) names every line it groups with — a guess until "
+                              + "the meeting ends, when the name moves to the real speaker.")
+                }
+            }
+        }
+        .onAppear {
+            engine.setWatching(true)
+            live.loadPastNames()
+        }
+        .onDisappear { engine.setWatching(false) }
+        .toolbar {
+            ToolbarItem {
+                Button(live.paused ? "Resume" : "Pause",
+                       systemImage: live.paused ? "play.fill" : "pause.fill") {
+                    engine.togglePause()
+                }
+                .help(live.paused ? "Show new lines again" : "Stop showing new lines — the transcript file keeps recording")
+            }
+            ToolbarItem {
+                Button("New transcript", systemImage: "doc.badge.plus") { confirmNew = true }
+                    .help("End this transcript and start a new one")
+            }
+            ToolbarItem {
+                HStack(spacing: 4) {
+                    Image(systemName: "textformat.size.smaller")
+                    Slider(value: $fontSize, in: 10...32).frame(width: 110)
+                    Image(systemName: "textformat.size.larger")
+                }
+                .help("Text size")
+            }
+        }
+    }
+
+    // MARK: transcript tab
+
+    private var transcript: some View {
+        VStack(spacing: 0) {
+            if !engine.enabled {
+                banner("Not listening.", action: ("Start listening", { engine.setEnabled(true) }))
+            } else if engine.loading {
+                banner("Loading model…")
+            } else if live.paused {
+                banner("Paused — still recording to the transcript file, just not shown here.")
+            }
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(live.lines) { line($0) }
+                    // Mic first: the same order every time, so the two do not swap places.
+                    ForEach(live.previews.sorted { $0.key < $1.key }, id: \.key) { p in
+                        preview(p.key, p.value)
+                    }
+                    Color.clear.frame(height: 1).id("end")
+                }
+                // Not while picking lines: jumping away mid-selection loses your place.
+                .onChange(of: live.lines.count) { if live.selected.isEmpty { proxy.scrollTo("end") } }
+                .onChange(of: live.previews) { if live.selected.isEmpty { proxy.scrollTo("end") } }
+                    .overlay {
+                        if live.lines.isEmpty && live.previews.isEmpty {
+                            Text("Lines appear here a few seconds after they are spoken.")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+            }
+            Divider()
+            HStack {
+                Text(live.selected.isEmpty ? "Click lines to select them for the agent"
+                                           : "\(live.selected.count) selected")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Clear selection") { live.selected = [] }
+                    .disabled(live.selected.isEmpty)
+            }
+            .font(.caption)
+            .padding(8)
+        }
+    }
+
+    @ViewBuilder
+    private func line(_ l: LiveLine) -> some View {
+        if l.isBreak {
+            Text("— \(l.text) —")
+                .font(.system(size: fontSize * 0.8))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+        } else {
+            let on = live.selected.contains(l.id)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(l.time)
+                    .font(.system(size: fontSize * 0.75).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: fontSize * 3.6, alignment: .leading)
+                // Beside the selection button, not inside it: a menu in a button's label
+                // never gets the click.
+                speakerMenu(l)
+                // A Button, not onTapGesture, so a row stays keyboard-reachable.
+                Button {
+                    if on { live.selected.remove(l.id) } else { live.selected.insert(l.id) }
+                } label: {
+                    HStack {
+                        Text(l.text).font(.system(size: fontSize))
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.vertical, 2)
+            .padding(.horizontal, 4)
+            .background(on ? Color.accentColor.opacity(0.18) : .clear,
+                        in: RoundedRectangle(cornerRadius: 4))
+        }
+    }
+
+    private func speakerMenu(_ l: LiveLine) -> some View {
+        let current = live.speaker(l)
+        let here = live.names(in: l.file).filter { $0 != current }
+        let before = live.pastNames.filter { $0 != current && !here.contains($0) }.prefix(12)
+        return Menu {
+            if !here.isEmpty {
+                Section("In this meeting") {
+                    ForEach(here, id: \.self) { n in Button(n) { sync(live.pick(l, n)) } }
+                }
+            }
+            if !before.isEmpty {
+                Section("Named before") {
+                    ForEach(Array(before), id: \.self) { n in Button(n) { sync(live.pick(l, n)) } }
+                }
+            }
+            Divider()
+            Button("Type a name…") {
+                typedName = live.isNamed(l) ? current : ""
+                naming = l
+            }
+            if live.isNamed(l) {
+                Button("Clear name") {
+                    sync(live.name(l, "", wholeVoice: !live.hasOwnName(l)))
+                }
+            }
+        } label: {
+            Text(current)
+                .font(.system(size: fontSize * 0.75))
+                .foregroundStyle(live.isNamed(l) || l.voice == "me" ? Color.accentColor : .secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .frame(minWidth: fontSize * 4.5, alignment: .leading)
+        .help("Who said this. A name picked for an unnamed voice names the whole voice; "
+              + "on a voice that already has a name it corrects just this line.")
+    }
+
+    private func commit(_ l: LiveLine, wholeVoice: Bool) {
+        sync(live.name(l, typedName, wholeVoice: wholeVoice))
+        naming = nil
+    }
+
+    private func sync(_ file: URL?) {
+        if let file { engine.syncNames(file) }
+    }
+
+    private func preview(_ source: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "waveform")
+                .font(.system(size: fontSize * 0.75))
+                .symbolEffect(.variableColor.iterative)
+                .frame(width: fontSize * 3.6, alignment: .leading)
+            Text(source == "mic" ? "me" : "…")
+                .font(.system(size: fontSize * 0.75))
+                .frame(minWidth: fontSize * 4.5, alignment: .leading)
+            Text(text).font(.system(size: fontSize)).italic()
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+    }
+
+    private func banner(_ text: String, action: (String, () -> Void)? = nil) -> some View {
+        HStack {
+            Text(text)
+            Spacer()
+            if let action { Button(action.0, action: action.1) }
+        }
+        .font(.callout)
+        .padding(8)
+        .background(.yellow.opacity(0.15))
+    }
+
+    // MARK: context tab
+
+    private var context: some View {
+        VStack(spacing: 0) {
+            List {
+                ForEach(docs.docs) { d in
+                    HStack {
+                        Image(systemName: "doc.text")
+                        VStack(alignment: .leading) {
+                            Text(d.name)
+                            Text("\(d.text.count) characters").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button { docs.remove(d) } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.borderless)
+                            .help("Remove from this session")
+                    }
+                }
+            }
+            .overlay {
+                if docs.docs.isEmpty {
+                    Text("Drop text files here, or paste text (⌘V).")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                docs.add(urls)
+                return !urls.isEmpty
+            }
+            .onPasteCommand(of: [.utf8PlainText, .plainText]) { _ in docs.paste() }
+
+            if let p = docs.problem {
+                Text(p).font(.caption).foregroundStyle(.red).padding(.horizontal, 8)
+            }
+            Divider()
+            HStack {
+                Button("Add files…", action: pickFiles)
+                Button("Paste text") { docs.paste() }
+                Menu("Recent") {
+                    let recent = docs.recent()
+                    if recent.isEmpty { Text("Nothing else used before") }
+                    ForEach(recent, id: \.self) { u in
+                        Button(u.lastPathComponent) { docs.add([u]) }
+                    }
+                }
+                .fixedSize()
+                Spacer()
+            }
+            .padding(8)
+        }
+    }
+
+    private func pickFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK { docs.add(panel.urls) }
+    }
+
+    // MARK: agent panel
+
+    private var agentPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Agent").font(.headline)
+                Spacer()
+                Toggle("Web & file tools", isOn: $agent.tools)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .help("Let Claude use WebSearch, WebFetch and Read (read-only)")
+                Button { agent.reset() } label: { Image(systemName: "square.and.pencil") }
+                    .buttonStyle(.borderless)
+                    .disabled(agent.running || agent.turns.isEmpty)
+                    .help("New conversation")
+            }
+            .padding(8)
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(agent.turns) { turn($0) }
+                        Color.clear.frame(height: 1).id("end")
+                    }
+                    .padding(10)
+                }
+                .onChange(of: agent.turns.last?.reply) { proxy.scrollTo("end", anchor: .bottom) }
+                .overlay {
+                    if agent.turns.isEmpty {
+                        Text("Select lines, add context, and ask.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Divider()
+            HStack(alignment: .bottom) {
+                TextField("Ask about the selected lines…", text: $question, axis: .vertical)
+                    .lineLimit(1...6)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(send)
+                if agent.running {
+                    Button("Stop", action: agent.stop)
+                } else {
+                    Button("Send", action: send)
+                        .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .keyboardShortcut(.return, modifiers: .command)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    private func turn(_ t: AgentTurn) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(t.prompt).bold()
+            if !t.attached.isEmpty {
+                Text(t.attached).font(.caption).foregroundStyle(.secondary)
+            }
+            if !t.reply.isEmpty {
+                Text((try? AttributedString(markdown: t.reply, options: .init(
+                    interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(t.reply))
+                    .textSelection(.enabled)
+            } else if agent.running, t.id == agent.turns.last?.id, t.note == nil {
+                ProgressView().controlSize(.small)
+            }
+            if let n = t.note { Text(n).foregroundStyle(.red).textSelection(.enabled) }
+        }
+        .font(.system(size: fontSize))
+    }
+
+    private func send() {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !agent.running else { return }
+        agent.ask(q, docs: docs.docs, lines: live.selection)
+        question = ""
+    }
+}

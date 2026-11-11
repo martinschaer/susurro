@@ -10,6 +10,9 @@ the menu bar. Personal prototype, handed to beta testers as an ad-hoc-signed zip
 labels on the system stream that persist across days, menu bar on/off toggle, append-only
 per-meeting JSONL transcripts in `~/.susurro/transcripts`.
 
+**Also in:** a live window for the meeting in progress, with an agent (`claude -p`) that
+answers questions about selected lines plus context documents — see § Live transcript.
+
 **Out:** search UI, audio retention, splitting two speakers *inside* one segment,
 summarization, sync, notifications, preferences window, launch-at-login, auto-update,
 tests beyond one smoke check.
@@ -305,6 +308,7 @@ created on first write, so a session where nobody spoke leaves nothing behind.
 ```
 [✓] Listening          ⌘L      → toggles capture
     ─────────────────
+    Live transcript…           → switches Listening on, opens the live window
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
     Name speakers…             → one Window scene: meetings, then the voices in one
     ─────────────────
@@ -323,6 +327,86 @@ in-flight load if you toggle off before it finishes.
 A failure in one source does not take the other down: if the mic is refused but the tap
 works, you still get `system` lines, and the reason appears in the menu.
 
+## Live transcript
+
+*Live transcript…* switches Listening on (or leaves it on) and opens one window: a
+Transcript tab, a Context tab, and an agent panel on the right. Closing the window leaves
+Listening alone.
+
+**Lines** arrive through `Transcriber.onLine` as each is written, with where in the file each
+one landed and a live guess at its voice — the file itself still says `unknown` on system
+lines until the meeting is clustered. A divider marks where one transcript file ends and
+the next begins, since live voice numbers restart with each file. Each line is one segment and is selectable on its own; *Clear selection* empties it.
+A text-size slider sits in the toolbar.
+
+**A preview runs ahead of the lines.** A talk rarely pauses for `silenceMs`, so segments
+run to `maxSegmentSec` and a line could arrive ~27 s after it was said. While the window is
+open and not paused, each `Segmenter` hands over its growing buffer every 2 s of speech
+(`onPreview`) and `Transcriber.preview` transcribes it into a grey line per source, which
+the real line replaces when the segment ends. Previews are display only — never written,
+never embedded — and they give way: only the newest buffer per source is kept, and one is
+skipped outright if a final segment is queued, so a preview can never delay a line or the
+file. The cost is a whisper pass on up to 25 s of audio every 2 s of speech, while the
+window is on screen; segments, the JSONL and speaker labels are unchanged.
+
+**Pause hides, it does not stop.** Capture and the JSONL carry on; the window just shows
+nothing new until Resume, and the paused stretch never appears in it. Every press also cuts
+both segmenters (`Segmenter.cut`), so the press is a segment boundary in the file too.
+What is hidden is decided by the *epoch the audio was captured in*, carried from the cut
+through `submit` to `onLine` — not by whether the window is paused when whisper's text comes
+back, which is seconds later and would hide the sentence said just before Pause and show
+the one said just before Resume. Even epochs show, odd ones hide. `cut` is the one
+`Segmenter` call made from main: it sets a locked epoch the next `push` applies on the audio
+thread.
+
+**Speakers are guessed live and named by hand.** Each system segment's voiceprint joins the
+nearest of this meeting's running centroids within `clusterThreshold`, or starts a new one
+(`LiveVoices`), so lines read `voice 1`, `voice 2` — deliberately not `s1`, which only
+exists once the meeting is clustered. That is a per-segment decision, the thing § Speakers
+says made labels unusable, so it stays out of the file: when the meeting ends it is still
+clustered from every segment at once, exactly as before.
+
+Clicking a line's speaker opens a menu: names used in this meeting, names from earlier
+meetings, *Type a name…*, *Clear name*. Picking a name for a voice with none names the whole
+voice; picking one on a voice that already has a name corrects just that line, because
+that is a misgrouped line, not a rename. Typing offers both explicitly. `unknown` lines (no
+voiceprint) are only ever named alone.
+
+The window spreads a voice's name over every line of it, but **only the line it was picked
+on reaches the file**. At publish, after clustering and before the move, `TranscriptNames.vote`
+takes the explicit picks by line index: whole-voice picks vote for their final `sN` cluster
+and the majority names it (ties alphabetical), `me` picks name every mic line, and
+just-this-line picks and picks on `unknown` lines name that line alone. Letting the spread
+names vote would let one wrong live merge write somebody's name onto someone else's
+cluster with nobody having said so. Names sent after a meeting was published — a silence
+gap rotated it, or Listening went off — are voted onto the published copy, ordered against
+the publish by the whisper queue. Voting adds and changes names; it never clears one.
+
+A line's index is counted only when it is actually written, so a dropped line cannot shift
+every name after it onto the wrong line.
+
+**New transcript** ends the meeting now — published, clustered and named like a silence gap
+— and clears the window. The rotation runs on the whisper queue, so lines already queued
+land in the old file, and the window clears only once they have arrived. Speech still
+being spoken at the press goes to the new file. Context and the agent conversation stay.
+
+**Context** is plain UTF-8 text: drop files, *Add files…*, or paste (⌘V / *Paste text*). The
+list lasts for this run of the app. Every document is also copied to `~/.susurro/context`
+(`0700`/`0600`), which is all *Recent* lists, so a later run can re-add it in one click. Same
+name replaces.
+
+**The agent** is `claude -p --output-format stream-json --include-partial-messages`, prompt on
+stdin, chained into one conversation with `--resume <session_id>`; the pencil starts a new
+one. Each question sends the selected lines (always — they are what the question is about)
+and any context document new or changed since the conversation last saw it. It runs from
+`~/.susurro/agent`, because `--resume` looks sessions up per directory, with
+`--setting-sources ""` and `--strict-mcp-config`: your hooks, plugins and MCP servers have no
+business in the middle of a call. Tools are off (`--tools ""`) unless the panel's switch is
+on, which allows exactly `WebSearch,WebFetch,Read`, listed in both `--tools` and
+`--allowedTools` because in `-p` nobody can answer a permission prompt. A Finder-launched
+app has no shell `PATH`, so the binary is looked for in `~/.local/bin`, `~/.claude/local`,
+`/opt/homebrew/bin` and `/usr/local/bin`.
+
 ## Files
 
 ```
@@ -332,6 +416,7 @@ susurro/
   Info.plist
   Sources/
     SusurroApp.swift    MenuBarExtra, enable/disable wiring, the naming window
+    Live.swift          the live window: transcript, context documents, claude agent
     Capture.swift       mic + system tap + segmenter
     Transcriber.swift   whisper context, serial queue, JSONL append
     Speaker.swift       embedding + persisted gallery + per-transcript names
@@ -340,9 +425,11 @@ susurro/
   vendor/fluidaudio/    shallow clone at v0.15.5 + .build/ (SwiftPM -> one .a)
 ```
 
-Four Swift files in the app. The fourth is `Speaker.swift`, and the why is that model
+Five Swift files in the app. The fourth is `Speaker.swift`, and the why is that model
 loading plus a persisted gallery is a different lifecycle from the whisper context —
-inlining it would blur the one thing `Transcriber.swift` currently does well. If a fifth
+inlining it would blur the one thing `Transcriber.swift` currently does well. The fifth is
+`Live.swift`: the live window drives a subprocess and holds documents, which is neither
+capture nor naming, and `SusurroApp.swift` was already the largest file. If a sixth
 appears, ask why.
 
 `bridge.h` replaces a module map: `swiftc -import-objc-header bridge.h` exposes the whole

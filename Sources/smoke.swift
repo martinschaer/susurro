@@ -21,7 +21,7 @@ enum Smoke {
     static func main() throws {
         // MARK: Segmenter — tone / silence / tone / silence -> exactly 2 utterances
         var segments: [[Float]] = []
-        let seg = Segmenter(config: Config()) { segments.append($0) }
+        let seg = Segmenter(config: Config()) { s, _ in segments.append(s) }
         seg.push(tone(1.0))
         seg.push(quiet(1.0))
         seg.push(tone(1.0))
@@ -29,9 +29,30 @@ enum Smoke {
         check(segments.count == 2, "segmenter cut 2 utterances (got \(segments.count))")
         check(segments.allSatisfy { $0.count > 16000 }, "each segment carries >1s of audio")
 
+        // Pause/resume cuts mid-speech, and what came before the press keeps its epoch —
+        // the live window hides by epoch, so a wrong stamp shows a paused line or hides
+        // a spoken one.
+        var cuts: [([Float], Int)] = []
+        let cutSeg = Segmenter(config: Config()) { cuts.append(($0, $1)) }
+        cutSeg.push(tone(1.0))
+        cutSeg.cut(to: 1)
+        cutSeg.push(tone(1.0))
+        cutSeg.push(quiet(1.0))
+        check(cuts.map(\.1) == [0, 1], "cut splits one utterance into epochs 0, 1 (got \(cuts.map(\.1)))")
+
+        // The live preview: the growing segment every 2 s of speech, then the real one.
+        var previews: [Int] = []
+        var finals = 0
+        let previewSeg = Segmenter(config: Config()) { _, _ in finals += 1 }
+        previewSeg.onPreview = { s, _ in previews.append(s.count) }
+        previewSeg.push(tone(5.0))
+        previewSeg.push(quiet(1.0))
+        check(previews.count == 2 && previews[0] < previews[1] && finals == 1,
+              "a 5 s utterance previews twice, growing, then ends once (got \(previews), \(finals))")
+
         // A stream that never crosses the gate must produce nothing.
         var none: [[Float]] = []
-        let quietSeg = Segmenter(config: Config()) { none.append($0) }
+        let quietSeg = Segmenter(config: Config()) { s, _ in none.append(s) }
         quietSeg.push(quiet(3.0))
         check(none.isEmpty, "silence produces no segments")
 
@@ -169,6 +190,39 @@ enum Smoke {
               "a name written when names lived in a sidecar survives the move into the file")
         check(TranscriptSnippets.meetings(dir: snips).count == 4,
               "and the sidecar is gone rather than left to be re-applied forever")
+
+        // MARK: live naming — only explicit picks reach the file, onto the real clusters
+        //
+        // As if just clustered. s1 has two whole-voice votes for Ana and one for Bruno; a
+        // just-this-line pick inside s1 must survive the majority, a pick on an `unknown`
+        // line names only that line, `me` names every mic line, and s2's unpicked line
+        // stays unnamed even though its other line was named alone.
+        let voted = snips.appendingPathComponent("2026-01-05_10-00-00.jsonl")
+        // A blank line too: `decode` and `rewrite` must agree on every index after it.
+        let speakers = ["s1", "s1", "s1", "s2", "", "unknown", "me", "me", "s2", "s1"]
+        try speakers.enumerated().map { i, sp in
+            sp.isEmpty ? "" : "{\"ts\":\"x\",\"speaker\":\"\(sp)\",\"text\":\"line \(i)\"}"
+        }.joined(separator: "\n").appending("\n").write(to: voted, atomically: true, encoding: .utf8)
+        TranscriptNames.vote([0: .init(name: "Ana", wholeVoice: true),
+                              1: .init(name: "Ana", wholeVoice: true),
+                              2: .init(name: "Bruno", wholeVoice: true),
+                              3: .init(name: "Carla", wholeVoice: false),
+                              5: .init(name: "Dan", wholeVoice: true),
+                              6: .init(name: "Martin", wholeVoice: true),
+                              9: .init(name: "Eve", wholeVoice: false)], in: voted)
+        let back = TranscriptSnippets.decode(voted)
+        let gotNames = back.map { $0?.name ?? "-" }
+        check(gotNames == ["Ana", "Ana", "Ana", "Carla", "-", "Dan", "Martin", "Martin", "-", "Eve"],
+              "live picks: majority per cluster, line picks stay put, unknown and mic as told "
+              + "(got \(gotNames))")
+        check(back.enumerated().allSatisfy { $1 == nil ? $0 == 4 : $1?.text == "line \($0)" },
+              "and no text moved")
+
+        // MARK: live voices — the window's running guess, on hand-built vectors
+        var lv = LiveVoices(threshold: 0.4)
+        let groups = [lv.assign([1, 0, 0]), lv.assign([0.95, 0.1, 0]), lv.assign([0, 1, 0]),
+                      lv.assign([0.9, 0, 0.1])]
+        check(groups == [0, 0, 1, 0], "near voices join, a far one starts its own (got \(groups))")
 
         try? FileManager.default.removeItem(at: snips)
 
@@ -387,13 +441,88 @@ enum Smoke {
         check(transcripts().count == 2,
               "a silence gap starts a second file (got \(transcripts().count))")
 
+        // Previews are display only, and give way to lines. One queued *ahead* of a line is
+        // skipped — running it would delay the line by a whole whisper pass.
+        sleep(1)
+        guard let t3 = Transcriber(model: model, vad: nil, dir: out, liveDir: hot) else {
+            print("  FAIL  reopen for preview check"); exit(1)
+        }
+        var seen: [String] = []
+        let seenLock = NSLock()
+        t3.onPreview = { _, text, _ in seenLock.withLock { seen.append(text) } }
+        t3.preview(pcm, source: "mic", epoch: 0)              // off: dropped
+        t3.setPreviews(true)
+        t3.preview(pcm, source: "mic", epoch: 0)
+        for _ in 0..<600 where seenLock.withLock({ seen.isEmpty }) { usleep(50_000) }
+        check(seenLock.withLock { seen.count == 1 && seen[0].contains("country") },
+              "a preview transcribes only once switched on (got \(seen))")
+        check(jsonl(hot).isEmpty, "and writes nothing")
+        t3.preview(pcm, source: "mic", epoch: 0)
+        t3.submit(pcm, source: "mic")
+        t3.close()
+        check(seenLock.withLock { seen.count == 1 },
+              "a preview queued ahead of a line is skipped (got \(seen.count) previews)")
+        check(transcripts().count == 3, "and the line is written")
+
+        // Where the window says a line is must be where it is, or a name lands on the wrong
+        // line. New transcript rotates: queued lines stay in the old file, indices restart,
+        // and a name sent while the file was live is on it when it is published.
+        sleep(1)
+        guard let t4 = Transcriber(model: model, vad: nil, dir: out, liveDir: hot) else {
+            print("  FAIL  reopen for rotate check"); exit(1)
+        }
+        var got: [(URL, Int)] = []
+        let gotLock = NSLock()
+        t4.onLine = { w, _ in gotLock.withLock { got.append((w.file, w.index)) } }
+        t4.submit(pcm, source: "mic")
+        t4.submit(pcm, source: "mic")
+        for _ in 0..<600 where gotLock.withLock({ got.count < 2 }) { usleep(50_000) }
+        // Sent while live: held, and applied at publish.
+        if let f = gotLock.withLock({ got.first?.0 }) {
+            t4.setNames([0: .init(name: "Ana", wholeVoice: false)], for: f)
+        }
+        let names = DispatchSemaphore(value: 0)
+        t4.rotate { names.signal() }
+        names.wait()
+        let before = gotLock.withLock { got }
+        // Sent after: voted straight onto the published copy.
+        if let f = before.first?.0 { t4.setNames([1: .init(name: "Martin", wholeVoice: false)], for: f) }
+        sleep(1)                       // the next file needs a different second
+        t4.submit(pcm, source: "mic")
+        t4.close()
+        let all = gotLock.withLock { got }
+        check(all.map(\.1) == [0, 1, 0] && Set(all.map(\.0)).count == 2,
+              "line indices follow the file, and restart in the new one (got \(all.map(\.1)))")
+        if let f = before.first?.0 {
+            let published = TranscriptSnippets.decode(out.appendingPathComponent(f.lastPathComponent))
+            check(published.map { $0?.name } == ["Ana", "Martin"],
+                  "names reach the file whether sent while live or after it was published "
+                  + "(got \(published.map { $0?.name }))")
+        }
+
+        // A session that opens with a system line: the file must exist before the voiceprint
+        // is taken, or that first line gets none and is never clustered.
+        if let voices {
+            sleep(1)
+            guard let t5 = Transcriber(model: model, vad: nil, voices: voices, dir: out,
+                                       liveDir: hot) else {
+                print("  FAIL  reopen for first-line check"); exit(1)
+            }
+            t5.submit(pcm, source: "system")
+            t5.close()
+            let first = transcripts().last!
+            check(TranscriptSnippets.decode(first).first??.seg == 0
+                  && VoicePrintFile.load(for: first).count == 1,
+                  "a session's first system line gets its voiceprint")
+        }
+
         // A meeting stranded by a crash is finished by definition: the next launch
         // publishes it rather than leaving it where nothing reads it.
         try "{\"ts\":\"x\",\"speaker\":\"user-1\",\"text\":\"orphaned\"}"
             .write(to: hot.appendingPathComponent("2026-01-09_09-00-00.jsonl"),
                    atomically: true, encoding: .utf8)
         _ = Transcriber(model: model, vad: nil, dir: out, liveDir: hot)
-        check(jsonl(hot).isEmpty && transcripts().count == 3,
+        check(jsonl(hot).isEmpty && transcripts().count == (voices == nil ? 6 : 7),
               "a transcript stranded by a crash is published on the next launch "
               + "(live \(jsonl(hot).count), published \(transcripts().count))")
 
