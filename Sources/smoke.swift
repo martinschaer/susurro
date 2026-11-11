@@ -40,6 +40,16 @@ enum Smoke {
         cutSeg.push(quiet(1.0))
         check(cuts.map(\.1) == [0, 1], "cut splits one utterance into epochs 0, 1 (got \(cuts.map(\.1)))")
 
+        // The live preview: the growing segment every 2 s of speech, then the real one.
+        var previews: [Int] = []
+        var finals = 0
+        let previewSeg = Segmenter(config: Config()) { _, _ in finals += 1 }
+        previewSeg.onPreview = { s, _ in previews.append(s.count) }
+        previewSeg.push(tone(5.0))
+        previewSeg.push(quiet(1.0))
+        check(previews.count == 2 && previews[0] < previews[1] && finals == 1,
+              "a 5 s utterance previews twice, growing, then ends once (got \(previews), \(finals))")
+
         // A stream that never crosses the gate must produce nothing.
         var none: [[Float]] = []
         let quietSeg = Segmenter(config: Config()) { s, _ in none.append(s) }
@@ -398,13 +408,36 @@ enum Smoke {
         check(transcripts().count == 2,
               "a silence gap starts a second file (got \(transcripts().count))")
 
+        // Previews are display only, and give way to lines. One queued *ahead* of a line is
+        // skipped — running it would delay the line by a whole whisper pass.
+        sleep(1)
+        guard let t3 = Transcriber(model: model, vad: nil, dir: out, liveDir: hot) else {
+            print("  FAIL  reopen for preview check"); exit(1)
+        }
+        var seen: [String] = []
+        let seenLock = NSLock()
+        t3.onPreview = { _, text, _ in seenLock.withLock { seen.append(text) } }
+        t3.preview(pcm, source: "mic", epoch: 0)              // off: dropped
+        t3.setPreviews(true)
+        t3.preview(pcm, source: "mic", epoch: 0)
+        for _ in 0..<600 where seenLock.withLock({ seen.isEmpty }) { usleep(50_000) }
+        check(seenLock.withLock { seen.count == 1 && seen[0].contains("country") },
+              "a preview transcribes only once switched on (got \(seen))")
+        check(jsonl(hot).isEmpty, "and writes nothing")
+        t3.preview(pcm, source: "mic", epoch: 0)
+        t3.submit(pcm, source: "mic")
+        t3.close()
+        check(seenLock.withLock { seen.count == 1 },
+              "a preview queued ahead of a line is skipped (got \(seen.count) previews)")
+        check(transcripts().count == 3, "and the line is written")
+
         // A meeting stranded by a crash is finished by definition: the next launch
         // publishes it rather than leaving it where nothing reads it.
         try "{\"ts\":\"x\",\"speaker\":\"user-1\",\"text\":\"orphaned\"}"
             .write(to: hot.appendingPathComponent("2026-01-09_09-00-00.jsonl"),
                    atomically: true, encoding: .utf8)
         _ = Transcriber(model: model, vad: nil, dir: out, liveDir: hot)
-        check(jsonl(hot).isEmpty && transcripts().count == 3,
+        check(jsonl(hot).isEmpty && transcripts().count == 4,
               "a transcript stranded by a crash is published on the next launch "
               + "(live \(jsonl(hot).count), published \(transcripts().count))")
 

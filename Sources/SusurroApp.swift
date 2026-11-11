@@ -424,6 +424,20 @@ final class Engine {
     func togglePause() {
         let e = live.toggle()
         segmenters.forEach { $0.cut(to: e) }
+        syncPreviews()
+    }
+
+    /// Whether the live window is on screen. Previews cost a whisper pass every two
+    /// seconds of speech, so they run only while it is — and not while paused.
+    func setWatching(_ on: Bool) {
+        watching = on
+        syncPreviews()
+    }
+
+    private var watching = false
+
+    private func syncPreviews() {
+        transcriber?.setPreviews(watching && !live.paused)
     }
 
     /// Runs the `models.sh` bundled in Resources — the same script `setup.sh` calls, so
@@ -521,6 +535,10 @@ final class Engine {
                 t.onLine = { [live = self.live] line, epoch in
                     DispatchQueue.main.async { live.receive(line, epoch: epoch) }
                 }
+                t.onPreview = { [live = self.live] source, text, epoch in
+                    DispatchQueue.main.async { live.preview(text, source: source, epoch: epoch) }
+                }
+                self.syncPreviews()
 
                 // Two segmenters, one per source: that split is the speaker attribution.
                 let ms = Segmenter(config: cfg) { [weak t] s, e in
@@ -529,6 +547,8 @@ final class Engine {
                 let ss = Segmenter(config: cfg) { [weak t] s, e in
                     t?.submit(s, source: "system", epoch: e)
                 }
+                ms.onPreview = { [weak t] s, e in t?.preview(s, source: "mic", epoch: e) }
+                ss.onPreview = { [weak t] s, e in t?.preview(s, source: "system", epoch: e) }
                 self.segmenters = [ms, ss]
                 self.segmenters.forEach { $0.cut(to: self.live.epoch) }   // paused stays paused
                 let m = MicCapture(seg: ms)

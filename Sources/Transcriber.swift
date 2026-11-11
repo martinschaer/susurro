@@ -35,6 +35,19 @@ final class Transcriber {
     /// whisper queue. The live window. Set before the first `submit`.
     var onLine: ((TranscriptLine, Int) -> Void)?
 
+    /// What the segment still being spoken says so far, by source, on the whisper queue.
+    /// Display only: never written, never embedded. Empty text means "no preview any
+    /// more" — sent when a segment ends without a line, so a stale one does not linger.
+    var onPreview: ((_ source: String, _ text: String, _ epoch: Int) -> Void)?
+
+    /// Previews are the first thing to give way. `queued` counts finals not yet run, and a
+    /// preview is skipped while there are any: it must never delay a line, nor the file.
+    /// `latest` holds only the newest buffer per source, so a backlog cannot form.
+    private let lock = NSLock()
+    private var queued = 0
+    private var latest: [String: ([Float], Int)] = [:]
+    private var previewing = false
+
     /// Where a transcript lives *while it is being written*. Not a detail: naming a voice
     /// rewrites the whole file, and this handle keeps a cached offset from
     /// `seekToEndOfFile()` that a rewrite underneath it would leave pointing mid-file, so
@@ -94,7 +107,31 @@ final class Transcriber {
 
     /// Hand a finished segment over for transcription. Returns immediately.
     func submit(_ samples: [Float], source: String, epoch: Int = 0) {
-        queue.async { [weak self] in self?.run(samples, source, epoch) }
+        lock.withLock { queued += 1 }
+        queue.async { [weak self] in
+            self?.run(samples, source, epoch)
+            self?.lock.withLock { self?.queued -= 1 }
+        }
+    }
+
+    /// Switch previews on only while someone is looking: each one is a whisper pass.
+    func setPreviews(_ on: Bool) {
+        lock.withLock {
+            previewing = on
+            if !on { latest = [:] }
+        }
+    }
+
+    /// The in-progress segment, for `onPreview`. Returns immediately; dropped when off,
+    /// and replaced if a newer one for the same source arrives before it runs.
+    func preview(_ samples: [Float], source: String, epoch: Int) {
+        let schedule: Bool = lock.withLock {
+            guard previewing else { return false }
+            let idle = latest.isEmpty
+            latest[source] = (samples, epoch)
+            return idle
+        }
+        if schedule { queue.async { [weak self] in self?.runPreviews() } }
     }
 
     /// Drain in-flight work, then release the model.
@@ -112,36 +149,26 @@ final class Transcriber {
 
     // MARK: - transcription
 
+    private func runPreviews() {
+        guard !closed else { return }      // the context is already freed
+        let jobs: [String: ([Float], Int)] = lock.withLock {
+            defer { latest = [:] }
+            return queued > 0 ? [:] : latest
+        }
+        for (source, (samples, epoch)) in jobs {
+            guard let (text, _) = transcribe(samples) else { continue }
+            onPreview?(source, text, epoch)
+        }
+    }
+
     private func run(_ samples: [Float], _ source: String, _ epoch: Int) {
-        guard !closed, samples.count >= 4800 else { return }   // < 300 ms is not worth a pass
-
-        var p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-        p.print_realtime = false
-        p.print_progress = false
-        p.print_timestamps = false
-        p.print_special = false
-        p.no_context = true            // segments are independent; without this one bad
-                                       // transcription poisons the rest of the day
-        p.suppress_blank = true
-        p.suppress_nst = true          // drop (music), [BLANK_AUDIO] and friends
-        p.language = UnsafePointer(autoLang)
-        p.detect_language = false
-        p.n_threads = Int32(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))
-        if let v = vadPath {
-            p.vad = true
-            p.vad_model_path = UnsafePointer(v)
+        guard !closed else { return }
+        // Whatever happens below, this segment's preview is finished: either a line
+        // replaces it, or nothing does and it must be cleared.
+        guard let (text, lang) = transcribe(samples) else {
+            onPreview?(source, "", epoch)
+            return
         }
-
-        guard whisper_full(ctx, p, samples, Int32(samples.count)) == 0 else { return }
-
-        var text = ""
-        for i in 0..<whisper_full_n_segments(ctx) {
-            text += String(cString: whisper_full_get_segment_text(ctx, i))
-        }
-        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-
-        let lang = String(cString: whisper_lang_str(whisper_full_lang_id(ctx)))
 
         // "mic" is you — a fact no embedding can improve on. Only the system stream needs
         // identifying, and nothing here identifies it: the voiceprint is kept and the
@@ -162,6 +189,39 @@ final class Transcriber {
         let line = append(text, source: source, speaker: speaker, seg: seg,
                           dur: Double(samples.count) / 16000, lang: lang)
         onLine?(line, epoch)
+    }
+
+    /// One whisper pass: the text and its language, or nil for nothing worth a line.
+    /// Shared by lines and previews — on `queue` only, the context is not reentrant.
+    private func transcribe(_ samples: [Float]) -> (String, String)? {
+        guard samples.count >= 4800 else { return nil }   // < 300 ms is not worth a pass
+
+        var p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        p.print_realtime = false
+        p.print_progress = false
+        p.print_timestamps = false
+        p.print_special = false
+        p.no_context = true            // segments are independent; without this one bad
+                                       // transcription poisons the rest of the day
+        p.suppress_blank = true
+        p.suppress_nst = true          // drop (music), [BLANK_AUDIO] and friends
+        p.language = UnsafePointer(autoLang)
+        p.detect_language = false
+        p.n_threads = Int32(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))
+        if let v = vadPath {
+            p.vad = true
+            p.vad_model_path = UnsafePointer(v)
+        }
+
+        guard whisper_full(ctx, p, samples, Int32(samples.count)) == 0 else { return nil }
+
+        var text = ""
+        for i in 0..<whisper_full_n_segments(ctx) {
+            text += String(cString: whisper_full_get_segment_text(ctx, i))
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return (text, String(cString: whisper_lang_str(whisper_full_lang_id(ctx))))
     }
 
     // MARK: - storage

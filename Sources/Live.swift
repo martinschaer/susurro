@@ -25,6 +25,11 @@ final class LiveTranscript {
     var selected: Set<Int> = []
     private var pausedAt: Date?
 
+    /// What each source is saying right now, before its line exists: re-transcribed every
+    /// two seconds of speech and replaced by the real line when the segment ends. Shown,
+    /// never selectable — it is a draft of a line, and the line is what gets sent.
+    private(set) var previews: [String: String] = [:]
+
     var paused: Bool { epoch % 2 == 1 }
 
     /// The selected segments, oldest first — the order they were said in.
@@ -35,6 +40,7 @@ final class LiveTranscript {
         epoch += 1
         if paused {
             pausedAt = Date()
+            previews = [:]
         } else if let from = pausedAt {
             // The marker goes in on resume, not on pause: by now the lines from before the
             // press have come back from whisper and sit above it, where they were said.
@@ -46,7 +52,13 @@ final class LiveTranscript {
         return epoch
     }
 
+    func preview(_ text: String, source: String, epoch e: Int) {
+        guard e % 2 == 0, !paused else { return }
+        previews[source] = text.isEmpty ? nil : text
+    }
+
     func receive(_ l: TranscriptLine, epoch e: Int) {
+        if let source = l.source { previews[source] = nil }
         guard e % 2 == 0 else { return }
         // "2026-08-10T14:32:07+02:00" → "14:32:07"
         lines.append(LiveLine(id: lines.count, time: String(l.ts.dropFirst(11).prefix(8)),
@@ -330,6 +342,8 @@ struct LiveView: View {
             agentPanel.frame(minWidth: 300, idealWidth: 360)
         }
         .frame(minWidth: 720, minHeight: 440)
+        .onAppear { engine.setWatching(true) }
+        .onDisappear { engine.setWatching(false) }
         .toolbar {
             ToolbarItem {
                 Button(live.paused ? "Resume" : "Pause",
@@ -361,15 +375,19 @@ struct LiveView: View {
                 banner("Paused — still recording to the transcript file, just not shown here.")
             }
             ScrollViewReader { proxy in
-                List(live.lines) { line($0) }
-                    .onChange(of: live.lines.count) {
-                        // Not while picking lines: jumping away mid-selection loses your place.
-                        if live.selected.isEmpty, let last = live.lines.last {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+                List {
+                    ForEach(live.lines) { line($0) }
+                    // Mic first: the same order every time, so the two do not swap places.
+                    ForEach(live.previews.sorted { $0.key < $1.key }, id: \.key) { p in
+                        preview(p.key, p.value)
                     }
+                    Color.clear.frame(height: 1).id("end")
+                }
+                // Not while picking lines: jumping away mid-selection loses your place.
+                .onChange(of: live.lines.count) { if live.selected.isEmpty { proxy.scrollTo("end") } }
+                .onChange(of: live.previews) { if live.selected.isEmpty { proxy.scrollTo("end") } }
                     .overlay {
-                        if live.lines.isEmpty {
+                        if live.lines.isEmpty && live.previews.isEmpty {
                             Text("Lines appear here a few seconds after they are spoken.")
                                 .foregroundStyle(.secondary)
                         }
@@ -406,6 +424,7 @@ struct LiveView: View {
                     Text(l.time)
                         .font(.system(size: fontSize * 0.75).monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .frame(width: fontSize * 3.6, alignment: .leading)
                     Text(l.speaker)
                         .font(.system(size: fontSize * 0.75))
                         .foregroundStyle(l.speaker == "me" ? Color.accentColor : .secondary)
@@ -421,6 +440,23 @@ struct LiveView: View {
             }
             .buttonStyle(.plain)
         }
+    }
+
+    private func preview(_ source: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "waveform")
+                .font(.system(size: fontSize * 0.75))
+                .symbolEffect(.variableColor.iterative)
+                .frame(width: fontSize * 3.6, alignment: .leading)
+            Text(source == "mic" ? "me" : "…")
+                .font(.system(size: fontSize * 0.75))
+                .frame(minWidth: fontSize * 3.5, alignment: .leading)
+            Text(text).font(.system(size: fontSize)).italic()
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
     }
 
     private func banner(_ text: String, action: (String, () -> Void)? = nil) -> some View {

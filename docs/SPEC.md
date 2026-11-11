@@ -338,6 +338,16 @@ what the file gets, `me` / `unknown` included — speakers do not exist until th
 closes. Each line is one segment and is selectable on its own; *Clear selection* empties it.
 A text-size slider sits in the toolbar.
 
+**A preview runs ahead of the lines.** A talk rarely pauses for `silenceMs`, so segments
+run to `maxSegmentSec` and a line could arrive ~27 s after it was said. While the window is
+open and not paused, each `Segmenter` hands over its growing buffer every 2 s of speech
+(`onPreview`) and `Transcriber.preview` transcribes it into a grey line per source, which
+the real line replaces when the segment ends. Previews are display only — never written,
+never embedded — and they give way: only the newest buffer per source is kept, and one is
+skipped outright if a final segment is queued, so a preview can never delay a line or the
+file. The cost is a whisper pass on up to 25 s of audio every 2 s of speech, while the
+window is on screen; segments, the JSONL and speaker labels are unchanged.
+
 **Pause hides, it does not stop.** Capture and the JSONL carry on; the window just shows
 nothing new until Resume, and the paused stretch never appears in it. Every press also cuts
 both segmenters (`Segmenter.cut`), so the press is a segment boundary in the file too.

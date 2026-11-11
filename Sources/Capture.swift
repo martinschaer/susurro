@@ -83,6 +83,13 @@ final class Segmenter {
     /// The samples, and the epoch they were *captured* in. See `cut`.
     private let emit: ([Float], Int) -> Void
 
+    /// The segment still being spoken, every `previewSamples` of growth: the live window's
+    /// running preview. Called on the audio thread like `emit`; set before the first push.
+    /// ponytail: fixed 2 s cadence; make it config if 2 s is wrong for someone's machine.
+    var onPreview: (([Float], Int) -> Void)?
+    private let previewSamples = 2 * 16000
+    private var previewed = 0          // buf.count at the last preview
+
     private var pending: [Float] = []  // sub-frame remainder between pushes
     private var buf: [Float] = []
     private var preroll: [Float] = []
@@ -148,12 +155,17 @@ final class Segmenter {
             if preroll.count > cap { preroll.removeFirst(preroll.count - cap) }
         }
 
-        if speaking && buf.count >= maxSamples { flush() }
+        if speaking && buf.count >= maxSamples {
+            flush()
+        } else if speaking, let onPreview, buf.count - previewed >= previewSamples {
+            previewed = buf.count
+            onPreview(buf, epoch)
+        }
     }
 
     private func flush() {
         if voiced >= minSpeechFrames { emit(buf, epoch) }
-        buf = []; preroll = []; speaking = false; silent = 0; voiced = 0
+        buf = []; preroll = []; speaking = false; silent = 0; voiced = 0; previewed = 0
     }
 }
 
