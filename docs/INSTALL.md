@@ -66,7 +66,7 @@ silently on login is worse than one you have to switch on.
 | Meeting in progress | `~/.susurro/live` — moved into `transcripts` when it ends |
 | Settings | `~/.susurro/config.json` — optional, every key has a default |
 
-Menu ▸ **Open transcripts…** opens the folder. Menu ▸ **Name speakers…** puts real names on
+Menu ▸ **Open transcripts…** opens the folder. Menu ▸ **Meetings…** puts real names on
 the `user-N` voices, one meeting at a time, with a sample of what each one said to help you
 tell them apart.
 

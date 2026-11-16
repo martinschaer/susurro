@@ -98,6 +98,14 @@ enum Smoke {
               "every voice in the meeting, and `me` is not one of them "
               + "(got \(roster.map(\.label)))")
         check(roster[0].lines == 3, "lines per voice (got \(roster[0].lines))")
+
+        // MARK: meeting details — a sidecar that is not a transcript
+        check(meetings[1].title == meetings[1].stamp, "an untitled meeting reads as its stamp")
+        MeetingDetails(title: "Standup", attendees: ["Ana", "Bruno"]).save(for: a)
+        let titled = TranscriptSnippets.meetings(dir: snips)
+        check(titled.count == 2, "the sidecar is not listed as a meeting")
+        check(titled[1].title == "Standup" && titled[1].details.attendees == ["Ana", "Bruno"],
+              "title and attendees come back (got \(titled[1].details))")
         check(roster[0].sample.hasPrefix("the longest thing"),
               "the sample is the longest line, not the first (got \(roster[0].sample))")
 

@@ -453,6 +453,9 @@ struct LiveView: View {
     @Bindable var agent: Agent
 
     @AppStorage("liveFontSize") private var fontSize = 14.0
+    @AppStorage("liveShowAgent") private var showAgent = false
+    /// Of the background only: the text stays solid, so the window can sit over a call.
+    @AppStorage("liveOpacity") private var opacity = 1.0
     @State private var tab = 0
     @State private var question = ""
     @State private var naming: LiveLine?        // the line "Type a name…" was chosen on
@@ -473,9 +476,10 @@ struct LiveView: View {
             }
             .frame(minWidth: 380)
 
-            agentPanel.frame(minWidth: 300, idealWidth: 360)
+            if showAgent { agentPanel.frame(minWidth: 300, idealWidth: 360) }
         }
-        .frame(minWidth: 720, minHeight: 440)
+        .frame(minWidth: showAgent ? 720 : 380, minHeight: 440)
+        .background(WindowOpacity(opacity: opacity))
         .confirmationDialog("Start a new transcript?", isPresented: $confirmNew) {
             Button("New transcript") { engine.newTranscript() }
         } message: {
@@ -521,11 +525,22 @@ struct LiveView: View {
             }
             ToolbarItem {
                 HStack(spacing: 4) {
+                    Image(systemName: "circle.lefthalf.filled")
+                    Slider(value: $opacity, in: 0.2...1).frame(width: 80)
+                }
+                .help("Background opacity")
+            }
+            ToolbarItem {
+                HStack(spacing: 4) {
                     Image(systemName: "textformat.size.smaller")
                     Slider(value: $fontSize, in: 10...32).frame(width: 110)
                     Image(systemName: "textformat.size.larger")
                 }
                 .help("Text size")
+            }
+            ToolbarItem {
+                Toggle(isOn: $showAgent) { Label("Agent", systemImage: "sidebar.right") }
+                    .help(showAgent ? "Hide the agent" : "Show the agent")
             }
         }
     }
@@ -550,6 +565,7 @@ struct LiveView: View {
                     }
                     Color.clear.frame(height: 1).id("end")
                 }
+                .scrollContentBackground(.hidden)     // or the window's opacity stops here
                 // Not while picking lines: jumping away mid-selection loses your place.
                 .onChange(of: live.lines.count) { if live.selected.isEmpty { proxy.scrollTo("end") } }
                 .onChange(of: live.previews) { if live.selected.isEmpty { proxy.scrollTo("end") } }
@@ -704,6 +720,7 @@ struct LiveView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
             .overlay {
                 if docs.docs.isEmpty {
                     Text("Drop text files here, or paste text (⌘V).")
@@ -821,5 +838,22 @@ struct LiveView: View {
         guard !q.isEmpty, !agent.running else { return }
         agent.ask(q, docs: docs.docs, lines: live.selection)
         question = ""
+    }
+}
+
+/// Makes the hosting window's background see-through to `opacity`. Only the background:
+/// `alphaValue` would fade the text with it, and the text is what you are reading.
+private struct WindowOpacity: NSViewRepresentable {
+    let opacity: Double
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        // Async: on the first pass the view is not in a window yet.
+        DispatchQueue.main.async {
+            guard let w = view.window else { return }
+            w.isOpaque = opacity >= 1
+            w.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(opacity)
+        }
     }
 }

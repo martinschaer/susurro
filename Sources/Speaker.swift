@@ -366,7 +366,7 @@ enum TranscriptNames {
     ///   line only — and wins over its cluster's name.
     ///
     /// Adds and changes names; never clears one. ponytail: a name removed in the window
-    /// after the meeting was published stays in the file; clear it in *Name speakers…*.
+    /// after the meeting was published stays in the file; clear it in *Meetings…*.
     static func vote(_ picks: [Int: NamePick], in transcript: URL) {
         guard !picks.isEmpty else { return }
         let lines = TranscriptSnippets.decode(transcript)
@@ -409,6 +409,32 @@ enum TranscriptNames {
     }
 }
 
+/// What a meeting was, as the user tells it: a title and who attended.
+///
+/// A sidecar (`<stamp>.meeting.json`), unlike names, because a transcript's lines are
+/// addressed by index (`TranscriptNames.vote`, `Engine.syncNames`) and a header line
+/// would shift every pick by one.
+struct MeetingDetails: Codable, Equatable {
+    var title: String?
+    var attendees: [String] = []
+
+    static func url(for transcript: URL) -> URL {
+        transcript.deletingPathExtension().appendingPathExtension("meeting.json")
+    }
+
+    static func load(for transcript: URL) -> MeetingDetails {
+        (try? Data(contentsOf: url(for: transcript)))
+            .flatMap { try? JSONDecoder().decode(MeetingDetails.self, from: $0) } ?? MeetingDetails()
+    }
+
+    func save(for transcript: URL) {
+        let file = Self.url(for: transcript)
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        try? data.write(to: file, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+}
+
 // MARK: - reading the transcripts
 
 /// What a voice actually said, so a human can work out whose it is. A `user-N` on its own
@@ -444,7 +470,11 @@ enum TranscriptSnippets {
         let url: URL
         let lines: Int
         let voices: [Voice]
+        var details = MeetingDetails()
         var id: URL { url }
+
+        /// The title if somebody gave one, the stamp otherwise.
+        var title: String { details.title ?? stamp }
 
         /// `2026-09-15_14-02-11` as `2026-09-15 14:02`. Seconds are in the file name to
         /// keep an off/on inside one minute from reopening the previous session's file;
@@ -480,7 +510,8 @@ enum TranscriptSnippets {
                 Voice(label: $0, name: named[$0], lines: counts[$0] ?? 0, sample: samples[$0] ?? "")
             }
             // Decodable lines only: a half-written tail is not a line anybody can read.
-            return Meeting(url: file, lines: lines.compactMap { $0 }.count, voices: voices)
+            return Meeting(url: file, lines: lines.compactMap { $0 }.count, voices: voices,
+                           details: MeetingDetails.load(for: file))
         }
     }
 

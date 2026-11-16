@@ -42,9 +42,9 @@ struct SusurroApp: App {
             Button("Open transcripts…") {
                 NSWorkspace.shared.activateFileViewerSelecting([Transcriber.defaultDir])
             }
-            Button("Name speakers…") {
+            Button("Meetings…") {
                 NSApp.activate(ignoringOtherApps: true)   // an LSUIElement app is never frontmost
-                openWindow(id: "speakers")
+                openWindow(id: "meetings")
             }
 
             Divider()
@@ -57,8 +57,8 @@ struct SusurroApp: App {
             Image(systemName: engine.listening ? "waveform" : "waveform.slash")
         }
 
-        Window("Transcripts", id: "speakers") { TranscriptsView() }
-            .windowResizability(.contentSize)
+        Window("Meetings", id: "meetings") { TranscriptsView() }
+            .defaultSize(width: 640, height: 640)
 
         Window("Live transcript", id: "live") {
             LiveView(engine: engine, live: engine.live, docs: docs, agent: agent)
@@ -71,6 +71,11 @@ struct SusurroApp: App {
 /// possibly somebody else.
 private struct VoiceKey: Hashable {
     let transcript: URL, voice: String
+}
+
+/// A meeting's whole transcript, as opposed to a `URL`, which is the meeting's own page.
+private struct TranscriptKey: Hashable {
+    let transcript: URL
 }
 
 /// Every transcript, and who the voices in each one turned out to be.
@@ -121,6 +126,14 @@ final class Transcripts {
         else { return }
         meetings[i] = fresh
     }
+
+    /// Title and attendees: a small sidecar write, so no re-read of the transcript.
+    func save(_ details: MeetingDetails, in transcript: URL) {
+        guard let i = meetings.firstIndex(where: { $0.url == transcript }),
+              meetings[i].details != details else { return }
+        details.save(for: transcript)
+        meetings[i].details = details
+    }
 }
 
 /// The roster: one row per meeting. Naming starts here rather than at a voice because the
@@ -144,7 +157,7 @@ struct TranscriptsView: View {
                 ForEach(transcripts.meetings) { m in
                     NavigationLink(value: m.url) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(m.stamp)
+                            Text(m.title)
                             Text(subtitle(m)).font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -156,8 +169,11 @@ struct TranscriptsView: View {
             .navigationDestination(for: VoiceKey.self) {
                 VoiceView(key: $0, transcripts: transcripts)
             }
+            .navigationDestination(for: TranscriptKey.self) {
+                TranscriptReadView(key: $0, transcripts: transcripts)
+            }
         }
-        .frame(width: 460, height: 500)      // fixed, so pushing a view does not resize
+        .frame(minWidth: 460, minHeight: 500)
         .onAppear(perform: transcripts.reload)
     }
 
@@ -165,8 +181,9 @@ struct TranscriptsView: View {
     private func subtitle(_ m: TranscriptSnippets.Meeting) -> String {
         let unnamed = m.voices.filter { transcripts.name($0.label, in: m.url) == nil }.count
         let voices = "\(m.voices.count) voice\(m.voices.count == 1 ? "" : "s")"
-        return unnamed == 0 ? "\(voices) · \(m.lines) lines"
-                            : "\(unnamed) unnamed of \(voices) · \(m.lines) lines"
+        let stamp = m.details.title == nil ? "" : "\(m.stamp) · "
+        return stamp + (unnamed == 0 ? "\(voices) · \(m.lines) lines"
+                                     : "\(unnamed) unnamed of \(voices) · \(m.lines) lines")
     }
 }
 
@@ -191,10 +208,42 @@ private struct MeetingView: View {
     /// it happens on Enter, on picking a suggestion, and on leaving — never per keystroke.
     @State private var dirty: Set<String> = []
 
+    /// Title and attendees being typed, same rule as `typed`: nil until a key is pressed.
+    @State private var typedTitle: String?
+    @State private var typedAttendees: String?
+
     private var voices: [TranscriptSnippets.Voice] { transcripts.meeting(transcript)?.voices ?? [] }
+    private var details: MeetingDetails { transcripts.meeting(transcript)?.details ?? MeetingDetails() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Grid(alignment: .leading) {
+                GridRow {
+                    Text("Title").foregroundStyle(.secondary)
+                    TextField("Title", text: Binding(
+                        get: { typedTitle ?? details.title ?? "" },
+                        set: { typedTitle = $0 }),
+                        prompt: Text(transcripts.meeting(transcript)?.stamp ?? ""))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(commit)
+                }
+                GridRow {
+                    Text("Attendees").foregroundStyle(.secondary)
+                    TextField("Attendees", text: Binding(
+                        get: { typedAttendees ?? details.attendees.joined(separator: ", ") },
+                        set: { typedAttendees = $0 }),
+                        prompt: Text("Comma-separated"))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(commit)
+                }
+            }
+            HStack {
+                Text("Voices").font(.headline)
+                Spacer()
+                Button("Read transcript", systemImage: "text.alignleft") {
+                    path.append(TranscriptKey(transcript: transcript))
+                }
+            }
             if voices.isEmpty {
                 Text("Only your own voice in this one — `me` needs no naming.")
                     .foregroundStyle(.secondary)
@@ -207,7 +256,7 @@ private struct MeetingView: View {
             }
         }
         .padding()
-        .navigationTitle(transcripts.meeting(transcript)?.stamp ?? "Transcript")
+        .navigationTitle(transcripts.meeting(transcript)?.title ?? "Meeting")
         // Catches the edit that is typed and then navigated away from, which is how a name
         // got silently dropped before there was anywhere to drop it from.
         .onDisappear(perform: commit)
@@ -280,6 +329,19 @@ private struct MeetingView: View {
         transcripts.rename(dirty.reduce(into: [:]) { $0[$1] = typed[$1] ?? "" },
                            in: transcript)
         dirty = []
+
+        var d = details
+        if let t = typedTitle?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            d.title = t.isEmpty ? nil : t     // blank goes back to the stamp
+        }
+        if let a = typedAttendees {
+            d.attendees = a.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+        transcripts.save(d, in: transcript)
+        typedTitle = nil
+        typedAttendees = nil
     }
 
     /// Falls back to the stored name, so the very first render already shows it. The
@@ -288,6 +350,42 @@ private struct MeetingView: View {
     private func binding(_ voice: String) -> Binding<String> {
         Binding(get: { typed[voice] ?? transcripts.name(voice, in: transcript) ?? "" },
                 set: { set(voice, to: $0) })
+    }
+}
+
+/// A whole meeting, line by line: time, who, what.
+///
+/// Who is each line's own `name`, not the voice's: a "just this line" pick from the live
+/// window is written onto that line only, and resolving by voice would hide it.
+private struct TranscriptReadView: View {
+    let key: TranscriptKey
+    let transcripts: Transcripts
+
+    @State private var lines: [TranscriptLine] = []
+
+    var body: some View {
+        // By index: the same sentence can honestly turn up twice in one meeting.
+        List(lines.indices, id: \.self) { i in
+            let l = lines[i]
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(l.ts.dropFirst(11).prefix(8))      // "…T14:32:07+02:00" → "14:32:07"
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(l.name ?? l.speaker)
+                    .font(.caption)
+                    .foregroundStyle(l.name != nil || l.speaker == "me" ? Color.accentColor : .secondary)
+                    .lineLimit(1)
+                    .frame(width: 90, alignment: .leading)
+                Text(l.text).textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+        }
+        .overlay {
+            if lines.isEmpty { Text("Nothing in this transcript.").foregroundStyle(.secondary) }
+        }
+        .navigationTitle(transcripts.meeting(key.transcript)?.title ?? "Transcript")
+        // Decodable lines only: a torn tail is not a line anybody can read.
+        .onAppear { lines = TranscriptSnippets.decode(key.transcript).compactMap { $0 } }
     }
 }
 

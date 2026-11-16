@@ -18,7 +18,7 @@ recommended was a toolchain accident, not a technical judgement about the librar
 >
 > `speaker` is in the JSONL, the voiceprints live beside each transcript,
 
-> naming is the *Name speakers…* window (or hand-editing `name`, same file), and
+> naming is the *Meetings…* window (or hand-editing `name`, same file), and
 > `make smoke` covers minting, matching, reload, discrimination, and renaming. Step 3
 > (splitting a segment) is not built.
 
