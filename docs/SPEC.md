@@ -337,7 +337,8 @@ Listening alone.
 **Lines** arrive through `Transcriber.onLine` as each is written, with where in the file each
 one landed and a live guess at its voice — the file itself still says `unknown` on system
 lines until the meeting is clustered. A divider marks where one transcript file ends and
-the next begins, since live voice numbers restart with each file. Each line is one segment and is selectable on its own; *Clear selection* empties it.
+the next begins, since live voice numbers restart with each file. Each line is one segment.
+Opening the window does not listen: it shows a *Start meeting* button with an optional title (written to the meeting's sidecar). *End meeting* in the toolbar stops listening, publishes the file and opens the Meetings window.
 A text-size slider sits in the toolbar.
 
 **A preview runs ahead of the lines.** A talk rarely pauses for `silenceMs`, so segments
@@ -398,7 +399,7 @@ name replaces.
 
 **The agent** is `claude -p --output-format stream-json --include-partial-messages`, prompt on
 stdin, chained into one conversation with `--resume <session_id>`; the pencil starts a new
-one. Each question sends the selected lines (always — they are what the question is about)
+one. Each question sends the whole transcript
 and any context document new or changed since the conversation last saw it. It runs from
 `~/.susurro/agent`, because `--resume` looks sessions up per directory, with
 `--setting-sources ""` and `--strict-mcp-config`: your hooks, plugins and MCP servers have no

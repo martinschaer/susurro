@@ -35,7 +35,6 @@ struct SusurroApp: App {
 
             Divider()
             Button("Live transcript…") {
-                engine.setEnabled(true)
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "live")
             }
@@ -175,6 +174,10 @@ struct TranscriptsView: View {
         }
         .frame(minWidth: 460, minHeight: 500)
         .onAppear(perform: transcripts.reload)
+        // Already open behind another window when a meeting ends: onAppear will not fire.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            transcripts.reload()
+        }
     }
 
     /// Unnamed first, because that is the reason to open the row.
@@ -540,7 +543,33 @@ final class Engine {
     /// the press goes to the new file.
     func newTranscript() {
         guard let t = transcriber else { live.clear(); return }
-        t.rotate { [live] in DispatchQueue.main.async { live.clear() } }
+        let files = Set(live.lines.compactMap(\.file))
+        t.rotate { [live, self] in
+            DispatchQueue.main.async { self.saveTitle(files); live.clear() }
+        }
+    }
+
+    /// Typed on the start screen; goes on every file the meeting spans, once published.
+    var title = ""
+
+    /// Stop listening, which publishes the file, then title it and empty the window.
+    func endMeeting() {
+        let files = Set(live.lines.compactMap(\.file))
+        setEnabled(false)
+        saveTitle(files)
+        live.clear()
+        title = ""
+    }
+
+    private func saveTitle(_ files: Set<URL>) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        for f in files {
+            let published = Transcriber.defaultDir.appendingPathComponent(f.lastPathComponent)
+            var d = MeetingDetails.load(for: published)
+            d.title = t
+            d.save(for: published)
+        }
     }
 
     /// Send the window's name picks for `file` wherever they belong now: to the transcriber

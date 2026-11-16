@@ -32,12 +32,11 @@ struct LiveVoiceKey: Hashable {
 final class LiveTranscript {
     private(set) var lines: [LiveLine] = []
     private(set) var epoch = 0
-    var selected: Set<Int> = []
     private var pausedAt: Date?
 
     /// What each source is saying right now, before its line exists: re-transcribed every
     /// two seconds of speech and replaced by the real line when the segment ends. Shown,
-    /// never selectable — it is a draft of a line, and the line is what gets sent.
+    /// not sent to the agent — it is a draft of a line, and the line is what gets sent.
     private(set) var previews: [String: String] = [:]
 
     /// A live voice's name, shown on every line of it. Spread by the live grouping, which
@@ -51,10 +50,10 @@ final class LiveTranscript {
 
     var paused: Bool { epoch % 2 == 1 }
 
-    /// The selected segments, oldest first — the order they were said in — as the agent
+    /// Every segment, oldest first — the order they were said in — as the agent
     /// reads them: by name, not by live voice.
     var selection: [String] {
-        lines.filter { selected.contains($0.id) && !$0.isBreak }
+        lines.filter { !$0.isBreak }
             .map { "[\($0.time)] \(speaker($0)): \($0.text)" }
     }
 
@@ -149,7 +148,6 @@ final class LiveTranscript {
     /// with it at publish.
     func clear() {
         lines = []
-        selected = []
         previews = [:]
         voiceNames = [:]
         voicePicks = [:]
@@ -293,7 +291,7 @@ final class Agent {
     }
 
     /// Documents new or changed since this conversation last saw them go along; the
-    /// selected lines go every time, because the selection is what the question is about.
+    /// whole transcript goes every time.
     func ask(_ question: String, docs: [ContextDoc], lines: [String]) {
         guard !running else { return }
         let fresh = docs.filter { sent[$0.name] != $0.text }
@@ -461,6 +459,13 @@ struct LiveView: View {
     @State private var naming: LiveLine?        // the line "Type a name…" was chosen on
     @State private var typedName = ""
     @State private var confirmNew = false
+    @State private var confirmEnd = false
+    @State private var title = ""
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    /// No meeting running: not listening and nothing on screen.
+    private var idle: Bool { !engine.enabled && live.lines.isEmpty }
 
     var body: some View {
         HSplitView {
@@ -485,6 +490,16 @@ struct LiveView: View {
         } message: {
             Text("This meeting is saved, with its names, and the window starts empty. "
                  + "Context and the agent conversation stay.")
+        }
+        .confirmationDialog("End this meeting?", isPresented: $confirmEnd) {
+            Button("End meeting") {
+                engine.endMeeting()
+                dismissWindow(id: "live")
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "meetings")
+            }
+        } message: {
+            Text("The transcript is saved and the Meetings list opens.")
         }
         .alert("Who said this?", isPresented: Binding(get: { naming != nil },
                                                        set: { if !$0 { naming = nil } })) {
@@ -520,6 +535,11 @@ struct LiveView: View {
                 .help(live.paused ? "Show new lines again" : "Stop showing new lines — the transcript file keeps recording")
             }
             ToolbarItem {
+                Button("End meeting", systemImage: "stop.circle") { confirmEnd = true }
+                    .disabled(idle)
+                    .help("Stop listening, save the transcript and open the meetings list")
+            }
+            ToolbarItem {
                 Button("New transcript", systemImage: "doc.badge.plus") { confirmNew = true }
                     .help("End this transcript and start a new one")
             }
@@ -547,7 +567,34 @@ struct LiveView: View {
 
     // MARK: transcript tab
 
+    @ViewBuilder
     private var transcript: some View {
+        if idle { startView } else { transcriptBody }
+    }
+
+    private var startView: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            TextField("Title (optional)", text: $title)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 280)
+                .onSubmit(startMeeting)
+            Button("Start meeting", action: startMeeting)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            if let p = engine.problem { Text(p).font(.caption).foregroundStyle(.secondary) }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func startMeeting() {
+        engine.title = title
+        title = ""
+        engine.setEnabled(true)
+    }
+
+    private var transcriptBody: some View {
         VStack(spacing: 0) {
             if !engine.enabled {
                 banner("Not listening.", action: ("Start listening", { engine.setEnabled(true) }))
@@ -566,9 +613,8 @@ struct LiveView: View {
                     Color.clear.frame(height: 1).id("end")
                 }
                 .scrollContentBackground(.hidden)     // or the window's opacity stops here
-                // Not while picking lines: jumping away mid-selection loses your place.
-                .onChange(of: live.lines.count) { if live.selected.isEmpty { proxy.scrollTo("end") } }
-                .onChange(of: live.previews) { if live.selected.isEmpty { proxy.scrollTo("end") } }
+                .onChange(of: live.lines.count) { proxy.scrollTo("end") }
+                .onChange(of: live.previews) { proxy.scrollTo("end") }
                     .overlay {
                         if live.lines.isEmpty && live.previews.isEmpty {
                             Text("Lines appear here a few seconds after they are spoken.")
@@ -576,17 +622,6 @@ struct LiveView: View {
                         }
                     }
             }
-            Divider()
-            HStack {
-                Text(live.selected.isEmpty ? "Click lines to select them for the agent"
-                                           : "\(live.selected.count) selected")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Clear selection") { live.selected = [] }
-                    .disabled(live.selected.isEmpty)
-            }
-            .font(.caption)
-            .padding(8)
         }
     }
 
@@ -598,31 +633,17 @@ struct LiveView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)
         } else {
-            let on = live.selected.contains(l.id)
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(l.time)
                     .font(.system(size: fontSize * 0.75).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: fontSize * 3.6, alignment: .leading)
-                // Beside the selection button, not inside it: a menu in a button's label
-                // never gets the click.
                 speakerMenu(l)
-                // A Button, not onTapGesture, so a row stays keyboard-reachable.
-                Button {
-                    if on { live.selected.remove(l.id) } else { live.selected.insert(l.id) }
-                } label: {
-                    HStack {
-                        Text(l.text).font(.system(size: fontSize))
-                        Spacer(minLength: 0)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                Text(l.text).font(.system(size: fontSize))
+                Spacer(minLength: 0)
             }
             .padding(.vertical, 2)
             .padding(.horizontal, 4)
-            .background(on ? Color.accentColor.opacity(0.18) : .clear,
-                        in: RoundedRectangle(cornerRadius: 4))
         }
     }
 
@@ -791,7 +812,7 @@ struct LiveView: View {
                 .onChange(of: agent.turns.last?.reply) { proxy.scrollTo("end", anchor: .bottom) }
                 .overlay {
                     if agent.turns.isEmpty {
-                        Text("Select lines, add context, and ask.")
+                        Text("Add context and ask — the agent reads the whole transcript.")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -799,7 +820,7 @@ struct LiveView: View {
 
             Divider()
             HStack(alignment: .bottom) {
-                TextField("Ask about the selected lines…", text: $question, axis: .vertical)
+                TextField("Ask about the transcript…", text: $question, axis: .vertical)
                     .lineLimit(1...6)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(send)
