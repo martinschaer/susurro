@@ -310,7 +310,8 @@ created on first write, so a session where nobody spoke leaves nothing behind.
     ─────────────────
     Live transcript…           → switches Listening on, opens the live window
     Open transcripts…          → NSWorkspace.activateFileViewerSelecting
-    Name speakers…             → one Window scene: meetings, then the voices in one
+    Meetings…                  → one Window scene: meetings, then one meeting's title,
+                                 attendees, voices and full transcript
     ─────────────────
     Quit Susurro       ⌘Q
 ```
@@ -459,7 +460,7 @@ files; too high and two back-to-back meetings become one.
 
 Read once at enable. No file → defaults. No UI, no watcher; toggle off/on to reload.
 
-Naming is not, and it is per transcript. *Name speakers…* opens the list of meetings —
+Naming is not, and it is per transcript. *Meetings…* opens the list of meetings —
 date, how many voices, how many are still unnamed — because the meeting is what makes a
 `user-N` answerable: nobody remembers which FluidAudio id was Ana, but everybody remembers
 who was in Tuesday's call.
@@ -471,6 +472,11 @@ because a name typed and then navigated away from used to be dropped silently, w
 exactly like naming being broken. Not per keystroke: each write rewrites the transcript. A
 blank field **clears** the name: getting one wrong is the normal case here, and there would
 otherwise be no way to take it back.
+
+A meeting's title and attendees sit above its voices, saved on Return or on leaving like a
+name. They live in `<stamp>.meeting.json` beside the transcript rather than in it: lines are
+addressed by index, and a header line would shift every pick. *Read transcript* shows the
+whole meeting line by line — time, speaker (the line's own name, else its voice), text.
 
 The meeting in progress is not in the list, because it is not in the directory yet. That is
 the same fact that makes the rewrite safe.
