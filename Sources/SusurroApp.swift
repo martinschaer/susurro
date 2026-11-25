@@ -240,6 +240,7 @@ private struct MeetingView: View {
     @State private var typedTitle: String?
     @State private var typedAttendees: String?
     @State private var typedTags: String?
+    @State private var summarizer = Summarizer()
 
     private var voices: [TranscriptSnippets.Voice] { transcripts.meeting(transcript)?.voices ?? [] }
     private var details: MeetingDetails { transcripts.meeting(transcript)?.details ?? MeetingDetails() }
@@ -282,6 +283,25 @@ private struct MeetingView: View {
                 Button("Read transcript", systemImage: "text.alignleft") {
                     path.append(TranscriptKey(transcript: transcript))
                 }
+                Menu {
+                    if summarizer.text != nil {
+                        Button("Show last summary") { summarizer.showing = true }
+                        Divider()
+                    }
+                    ForEach([Summarizer.Engine.claude, .local], id: \.self) { e in
+                        Button(e.rawValue) {
+                            summarizer.run(e, transcript: transcript,
+                                           title: transcripts.meeting(transcript)?.title ?? "",
+                                           attendees: details.attendees)
+                        }
+                    }
+                } label: {
+                    Label(summarizer.running.map { "Summarising (\($0.rawValue))…" } ?? "Summarise",
+                          systemImage: "sparkles")
+                }
+                .menuStyle(.button)
+                .fixedSize()
+                .disabled(summarizer.running != nil)
             }
             if voices.isEmpty {
                 Text("Only your own voice in this one — `me` needs no naming.")
@@ -299,6 +319,35 @@ private struct MeetingView: View {
         // Catches the edit that is typed and then navigated away from, which is how a name
         // got silently dropped before there was anywhere to drop it from.
         .onDisappear(perform: commit)
+        .onAppear { summarizer.load(transcript) }
+        .sheet(isPresented: $summarizer.showing) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let e = summarizer.error {
+                    Text(e).foregroundStyle(.red).textSelection(.enabled)
+                } else {
+                    ScrollView {
+                        Text((try? AttributedString(
+                            markdown: summarizer.text ?? "",
+                            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                             ?? AttributedString(summarizer.text ?? ""))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                HStack {
+                    if summarizer.error == nil {
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(summarizer.text ?? "", forType: .string)
+                        }
+                    }
+                    Spacer()
+                    Button("Close") { summarizer.showing = false }.keyboardShortcut(.cancelAction)
+                }
+            }
+            .padding()
+            .frame(minWidth: 480, minHeight: 360)
+        }
     }
 
     private func row(_ v: TranscriptSnippets.Voice) -> some View {

@@ -79,6 +79,21 @@ names you have already used are offered as suggestions, most-used first.
 **The meeting in progress is not in the list.** It appears once it ends, which is also when
 its speakers are worked out.
 
+**Summaries.** In a meeting, **Summarise** offers two engines. *Claude* runs the `claude`
+CLI (you must be logged in). *Local* talks to [Ollama](https://ollama.com) on
+`127.0.0.1:11434`, so Ollama must be running with a model pulled, e.g.
+`ollama pull qwen2.5:7b`. Nothing leaves the Mac with Local. A summary is saved beside the
+transcript as `<transcript>.summary.md`, and a new run overwrites it. Pick the models in
+`~/.susurro/config.json` (read on every run, both optional):
+
+```json
+{ "summaryClaudeModel": "sonnet", "summaryLocalModel": "qwen2.5:14b-instruct-q4_K_M" }
+```
+
+Without them, Claude uses the CLI's default model and Local uses an installed qwen2.5, or
+any installed model. Why not `bart-large-cnn`: it reads 1024 tokens and was trained on news;
+a meeting is far longer.
+
 ## Known rough edges
 
 1. **Use headphones.** On speakers, your mic hears the call audio too, so everything is

@@ -45,6 +45,12 @@ struct Config {
     /// file is one meeting. Toggling Listening off/on always starts a new one too.
     var sessionGapMin = 5.0
 
+    /// Summarise → Claude: passed as `--model` (alias like "sonnet" or a full id). nil
+    /// leaves it to the CLI's default.
+    var summaryClaudeModel: String?
+    /// Summarise → Local: an Ollama model tag. nil picks an installed qwen2.5, else any.
+    var summaryLocalModel: String?
+
     /// Hand-rolled rather than Decodable: a custom `init(from:)` would need an explicit
     /// CodingKeys enum to tolerate partial JSON, which is more code than this.
     static func load() -> Config {
@@ -60,6 +66,8 @@ struct Config {
         if let v = o["clusterThreshold"] as? Double { c.clusterThreshold = Float(v) }
         if let v = o["minSpeakerSec"] as? Double { c.minSpeakerSec = v }
         if let v = o["sessionGapMin"] as? Double { c.sessionGapMin = v }
+        c.summaryClaudeModel = o["summaryClaudeModel"] as? String
+        c.summaryLocalModel = o["summaryLocalModel"] as? String
         return c
     }
 }
