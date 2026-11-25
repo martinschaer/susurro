@@ -417,6 +417,9 @@ enum TranscriptNames {
 struct MeetingDetails: Codable, Equatable {
     var title: String?
     var attendees: [String] = []
+    /// Optional so sidecars written before tags existed still decode (a missing key fails
+    /// a non-optional). Nil and empty mean the same.
+    var tags: [String]?
 
     static func url(for transcript: URL) -> URL {
         transcript.deletingPathExtension().appendingPathExtension("meeting.json")
