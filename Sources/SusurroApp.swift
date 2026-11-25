@@ -145,6 +145,13 @@ struct TranscriptsView: View {
     /// name field and the suggestions menu sitting in it.
     @State private var path = NavigationPath()
 
+    /// nil = every meeting.
+    @State private var tagFilter: String?
+
+    private var allTags: [String] {
+        Set(transcripts.meetings.flatMap { $0.details.tags ?? [] }).sorted()
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             List {
@@ -153,12 +160,23 @@ struct TranscriptsView: View {
                          + "the first time somebody speaks.")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(transcripts.meetings) { m in
+                ForEach(transcripts.meetings.filter {
+                    tagFilter == nil || ($0.details.tags ?? []).contains(tagFilter!)
+                }) { m in
                     NavigationLink(value: m.url) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(m.title)
                             Text(subtitle(m)).font(.caption).foregroundStyle(.secondary)
                         }
+                    }
+                    .contextMenu { Button("Copy path") { copyPath(m.url) } }
+                }
+            }
+            .toolbar {
+                if !allTags.isEmpty {
+                    Picker("Tag", selection: $tagFilter) {
+                        Text("All tags").tag(String?.none)
+                        ForEach(allTags, id: \.self) { Text($0).tag(String?.some($0)) }
                     }
                 }
             }
@@ -184,10 +202,17 @@ struct TranscriptsView: View {
     private func subtitle(_ m: TranscriptSnippets.Meeting) -> String {
         let unnamed = m.voices.filter { transcripts.name($0.label, in: m.url) == nil }.count
         let voices = "\(m.voices.count) voice\(m.voices.count == 1 ? "" : "s")"
-        let stamp = m.details.title == nil ? "" : "\(m.stamp) · "
+        let stamp = (m.details.title == nil ? "" : "\(m.stamp) · ")
+            + (m.details.tags ?? []).map { "#\($0)" }.joined(separator: " ")
+            + ((m.details.tags ?? []).isEmpty ? "" : " · ")
         return stamp + (unnamed == 0 ? "\(voices) · \(m.lines) lines"
                                      : "\(unnamed) unnamed of \(voices) · \(m.lines) lines")
     }
+}
+
+private func copyPath(_ url: URL) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(url.path, forType: .string)
 }
 
 /// One meeting: name every voice in it. The name lands in this transcript's sidecar and
@@ -214,6 +239,7 @@ private struct MeetingView: View {
     /// Title and attendees being typed, same rule as `typed`: nil until a key is pressed.
     @State private var typedTitle: String?
     @State private var typedAttendees: String?
+    @State private var typedTags: String?
 
     private var voices: [TranscriptSnippets.Voice] { transcripts.meeting(transcript)?.voices ?? [] }
     private var details: MeetingDetails { transcripts.meeting(transcript)?.details ?? MeetingDetails() }
@@ -239,10 +265,20 @@ private struct MeetingView: View {
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(commit)
                 }
+                GridRow {
+                    Text("Tags").foregroundStyle(.secondary)
+                    TextField("Tags", text: Binding(
+                        get: { typedTags ?? (details.tags ?? []).joined(separator: ", ") },
+                        set: { typedTags = $0 }),
+                        prompt: Text("Comma-separated, e.g. a customer"))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(commit)
+                }
             }
             HStack {
                 Text("Voices").font(.headline)
                 Spacer()
+                Button("Copy path", systemImage: "doc.on.doc") { copyPath(transcript) }
                 Button("Read transcript", systemImage: "text.alignleft") {
                     path.append(TranscriptKey(transcript: transcript))
                 }
@@ -342,9 +378,15 @@ private struct MeetingView: View {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }
+        if let t = typedTags {
+            d.tags = t.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
         transcripts.save(d, in: transcript)
         typedTitle = nil
         typedAttendees = nil
+        typedTags = nil
     }
 
     /// Falls back to the stored name, so the very first render already shows it. The

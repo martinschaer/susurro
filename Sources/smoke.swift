@@ -101,11 +101,12 @@ enum Smoke {
 
         // MARK: meeting details — a sidecar that is not a transcript
         check(meetings[1].title == meetings[1].stamp, "an untitled meeting reads as its stamp")
-        MeetingDetails(title: "Standup", attendees: ["Ana", "Bruno"]).save(for: a)
+        MeetingDetails(title: "Standup", attendees: ["Ana", "Bruno"], tags: ["acme"]).save(for: a)
         let titled = TranscriptSnippets.meetings(dir: snips)
         check(titled.count == 2, "the sidecar is not listed as a meeting")
         check(titled[1].title == "Standup" && titled[1].details.attendees == ["Ana", "Bruno"],
               "title and attendees come back (got \(titled[1].details))")
+        check(titled[1].details.tags == ["acme"], "tags come back")
         check(roster[0].sample.hasPrefix("the longest thing"),
               "the sample is the longest line, not the first (got \(roster[0].sample))")
 
