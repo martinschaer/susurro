@@ -282,7 +282,7 @@ final class Agent {
 
     /// A Finder-launched app gets PATH=/usr/bin:/bin, so look where installers put it.
     /// ponytail: fixed list; an nvm-managed npm install is not on it.
-    private static var claude: URL? {
+    static var claude: URL? {
         let home = NSHomeDirectory()
         return [home + "/.local/bin/claude", home + "/.claude/local/claude",
                 "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
@@ -439,6 +439,148 @@ final class Agent {
             }
         default: break
         }
+    }
+}
+
+/// One-shot meeting summary, either through the `claude` CLI or a local model on Ollama.
+///
+/// Local is Ollama's HTTP API rather than bart-large-cnn: BART reads 1024 tokens and is
+/// trained on news, a meeting is 10k+ tokens of dialogue. An instruct model with a long
+/// window does that job, and Ollama is already how most people have models on disk.
+/// ponytail: picks an installed model by name, no picker; one non-streaming request.
+@Observable
+final class Summarizer {
+    enum Engine: String { case claude = "Claude", local = "Local" }
+
+    private(set) var running: Engine?
+    private(set) var text: String?
+    private(set) var error: String?
+    var showing = false
+
+    /// Suggested when nothing is installed; otherwise whatever is, preferring qwen2.5.
+    static let suggested = "qwen2.5:7b"
+    private static let prompt = """
+        Summarise this meeting transcript (machine transcription of speech, so expect errors; \
+        speakers are names, "me" for the user, or "s1"/"s2" machine guesses). Give: a 2-3 \
+        sentence overview, key decisions, action items with owners if known, and open \
+        questions. Markdown, concise.
+        """
+
+    static func file(for transcript: URL) -> URL {
+        transcript.deletingPathExtension().appendingPathExtension("summary.md")
+    }
+
+    func load(_ transcript: URL) {
+        text = try? String(contentsOf: Self.file(for: transcript), encoding: .utf8)
+    }
+
+    func run(_ engine: Engine, transcript: URL, title: String, attendees: [String]) {
+        guard running == nil else { return }
+        let lines = TranscriptSnippets.decode(transcript).compactMap { $0 }
+            .map { "\($0.name ?? $0.speaker): \($0.text)" }
+        guard !lines.isEmpty else { error = "Nothing in this transcript."; showing = true; return }
+        let doc = "Title: \(title)\n"
+            + (attendees.isEmpty ? "" : "Attendees: \(attendees.joined(separator: ", "))\n")
+            + "\n" + lines.joined(separator: "\n")
+        running = engine
+        error = nil
+        Task {
+            do {
+                let out = engine == .claude ? try await Self.claude(doc) : try await Self.local(doc)
+                let clean = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty else { throw Fail("The model returned nothing.") }
+                try? clean.write(to: Self.file(for: transcript), atomically: true, encoding: .utf8)
+                text = clean
+            } catch {
+                self.error = (error as? Fail)?.message ?? error.localizedDescription
+            }
+            running = nil
+            showing = true
+        }
+    }
+
+    private struct Fail: Error { let message: String; init(_ m: String) { message = m } }
+
+    private static func claude(_ doc: String) async throws -> String {
+        guard let exe = Agent.claude else {
+            throw Fail("claude CLI not found — install it from code.claude.com")
+        }
+        try? FileManager.default.createDirectory(at: Agent.dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        let p = Process()
+        p.executableURL = exe
+        // Same isolation as Agent: no user hooks, MCP servers or tools.
+        p.arguments = ["-p", "--setting-sources", "", "--strict-mcp-config", "--tools", "",
+                       "--append-system-prompt", prompt]
+        if let m = Config.load().summaryClaudeModel { p.arguments! += ["--model", m] }
+        p.currentDirectoryURL = Agent.dir
+        let input = Pipe(), output = Pipe(), errors = Pipe()
+        p.standardInput = input
+        p.standardOutput = output
+        p.standardError = errors
+        signal(SIGPIPE, SIG_IGN)
+        return try await withCheckedThrowingContinuation { k in
+            DispatchQueue.global().async {
+                do { try p.run() } catch {
+                    k.resume(throwing: Fail("could not start claude: \(error.localizedDescription)"))
+                    return
+                }
+                // Write from another thread: a transcript is bigger than a pipe buffer.
+                DispatchQueue.global().async {
+                    try? input.fileHandleForWriting.write(contentsOf: Data(doc.utf8))
+                    try? input.fileHandleForWriting.close()
+                }
+                var err = Data()
+                let g = DispatchGroup()
+                g.enter()
+                DispatchQueue.global().async {
+                    err = errors.fileHandleForReading.readDataToEndOfFile()
+                    g.leave()
+                }
+                let out = output.fileHandleForReading.readDataToEndOfFile()
+                g.wait()
+                p.waitUntilExit()
+                if p.terminationStatus != 0 {
+                    let why = String(decoding: err, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    k.resume(throwing: Fail(why.isEmpty ? "claude exited (\(p.terminationStatus))" : why))
+                } else {
+                    k.resume(returning: String(decoding: out, as: UTF8.self))
+                }
+            }
+        }
+    }
+
+    private static func local(_ doc: String) async throws -> String {
+        let base = "http://127.0.0.1:11434/api/"
+        let model: String
+        do {
+            let (tags, _) = try await URLSession.shared.data(from: URL(string: base + "tags")!)
+            let names = ((try? JSONSerialization.jsonObject(with: tags) as? [String: Any])?["models"]
+                         as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? []
+            let want = Config.load().summaryLocalModel
+            guard let m = want ?? names.first(where: { $0.hasPrefix("qwen2.5") }) ?? names.first else {
+                throw Fail("No local model — run: ollama pull \(suggested)")
+            }
+            model = m
+        } catch let e as URLError {
+            _ = e
+            throw Fail("Ollama is not running — start it (ollama serve), then retry.")
+        }
+        var req = URLRequest(url: URL(string: base + "chat")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 1800      // a 7B model on a long meeting is minutes, not seconds
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": model, "stream": false,
+            // Ollama's default window is 4k and silently drops the head of a longer prompt.
+            "options": ["num_ctx": 32768],
+            "messages": [["role": "system", "content": prompt],
+                         ["role": "user", "content": doc]],
+        ] as [String: Any])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let e = o?["error"] as? String { throw Fail(e) }
+        return (o?["message"] as? [String: Any])?["content"] as? String ?? ""
     }
 }
 
